@@ -5,17 +5,13 @@ import io
 import yfinance as yf
 import pandas as pd
 import mplfinance as mpf
-
 # ============================
 # تنظیمات اصلی
 # ============================
 TOKEN ="8668166398:AAGC6ghQk6w7-4WPKG7BBowDsSNA364TC0E"
 CHAT_ID ="111531946"
-
 EMA_PERIOD = 5
 DIFF_THRESHOLD = -5  # درصد افت از EMA برای صدور هشدار
-
-
 def send_telegram_message(text):
     """ارسال پیام متنی به تلگرام"""
     if not TOKEN or not CHAT_ID:
@@ -26,8 +22,6 @@ def send_telegram_message(text):
         requests.post(url, data={"chat_id": CHAT_ID, "text": text})
     except:
         pass
-
-
 def send_telegram_photo(image_bytes, caption):
     """ارسال عکس (نمودار شمعی) همراه با کپشن به تلگرام"""
     if not TOKEN or not CHAT_ID:
