@@ -1,18 +1,24 @@
 import requests
 import time
+import os
 import yfinance as yf
 
 # ============================
 # تنظیمات اصلی
 # ============================
+# توکن و چت‌آیدی از Environment Variables خونده می‌شه (امن‌تر از نوشتن مستقیم توی کد)
 TOKEN = "8668166398:AAGC6ghQk6w7-4WPKG7BBowDsSNA364TC0E"
 CHAT_ID = "111531946"
 EMA_PERIOD = 5
 DIFF_THRESHOLD = -5  # درصد افت از EMA برای صدور هشدار
+TIMEFRAME_MINUTES = 30  # تایم‌فریم اسکن (به دقیقه)
 
 
 def send_telegram_message(text):
     """ارسال پیام به تلگرام"""
+    if not TOKEN or not CHAT_ID:
+        print("⚠️ توکن یا چت‌آیدی تنظیم نشده! پیام ارسال نشد.")
+        return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
         requests.post(url, data={"chat_id": CHAT_ID, "text": text})
@@ -47,14 +53,14 @@ def get_all_usdt_symbols():
 
 
 def check_crypto_market():
-    """اسکن بازار کریپتو (بایننس) - کندل روزانه"""
+    """اسکن بازار کریپتو (بایننس) - کندل ۳۰ دقیقه‌ای"""
     symbols = get_all_usdt_symbols()
     total = len(symbols)
     print(f"[کریپتو] {total} ارز پیدا شد.")
 
     for index, symbol in enumerate(symbols, 1):
         try:
-            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit=6"
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=30m&limit=10"
             response = requests.get(url).json()
             close_prices = [float(candle[4]) for candle in response]
             current_price = close_prices[-1]
@@ -66,7 +72,7 @@ def check_crypto_market():
                     msg = (
                         f"⚠️ [کریپتو] هشدار ریزش از EMA!\n"
                         f"نماد: {symbol}\n"
-                        f"تایم‌فریم: 1D\n"
+                        f"تایم‌فریم: 30m\n"
                         f"قیمت: {current_price}\n"
                         f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                         f"فاصله: {diff_percent:.2f}%"
@@ -102,16 +108,17 @@ def get_top100_us_symbols():
 
 
 def check_us_stocks_market():
-    """اسکن ۱۰۰ شرکت بزرگ آمریکا (Yahoo Finance) - کندل روزانه"""
+    """اسکن ۱۰۰ شرکت بزرگ آمریکا (Yahoo Finance) - کندل ۳۰ دقیقه‌ای"""
     symbols = get_top100_us_symbols()
     total = len(symbols)
     print(f"[سهام] {total} نماد پیدا شد.")
 
     for index, symbol in enumerate(symbols, 1):
         try:
-            data = yf.download(symbol, period="10d", interval="1d", progress=False)
+            # yfinance برای تایم‌فریم زیر ۱ روز، حداکثر ۶۰ روز گذشته رو پشتیبانی می‌کنه
+            data = yf.download(symbol, period="5d", interval="30m", progress=False)
             close_prices = data['Close'].values.flatten().tolist()
-            close_prices = close_prices[-6:]  # فقط ۶ کندل آخر
+            close_prices = close_prices[-10:]  # چند کندل آخر (کافی برای EMA5)
             current_price = close_prices[-1]
             ema_value = calculate_ema(close_prices, EMA_PERIOD)
 
@@ -121,7 +128,7 @@ def check_us_stocks_market():
                     msg = (
                         f"⚠️ [سهام آمریکا] هشدار ریزش از EMA!\n"
                         f"نماد: {symbol}\n"
-                        f"تایم‌فریم: 1D\n"
+                        f"تایم‌فریم: 30m\n"
                         f"قیمت: {current_price:.2f}\n"
                         f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                         f"فاصله: {diff_percent:.2f}%"
@@ -141,7 +148,11 @@ def check_us_stocks_market():
 # ============================
 if __name__ == "__main__":
     print("ربات اسکنر چند-بازاره روشن شد...")
-    send_telegram_message(f"✅ ربات اسکنر کریپتو + ۱۰۰ سهام برتر آمریکا (EMA{EMA_PERIOD} روزانه) روشن شد!")
+
+    if not TOKEN or not CHAT_ID:
+        print("⚠️⚠️⚠️ هشدار: TELEGRAM_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده! لطفاً توی Railway Variables تنظیم کن.")
+
+    send_telegram_message(f"✅ ربات اسکنر کریپتو + ۱۰۰ سهام برتر آمریکا (EMA{EMA_PERIOD} - تایم‌فریم 30m) روشن شد!")
 
     while True:
         start_time = time.time()
