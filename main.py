@@ -21,10 +21,13 @@ REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز روزانه قبل �
 CYCLE_SECONDS = 300          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
 REQUEST_TIMEOUT = 15
 CRYPTO_RANK_LIMIT = 300      # فقط ۳۰۰ ارز برتر بر اساس حجم معاملات ۲۴ ساعته (رنک نقدشوندگی)
+TSE_RANK_LIMIT = 200         # فقط ۲۰۰ نماد برتر بورس تهران بر اساس حجم معاملات امروز
+FROZEN_TOLERANCE = 0.0001    # اگه فاصله قیمت-EMA به این میزان یا کمتر تغییر کنه، نماد "مرده" حساب میشه
+IRAN_BROKER_CHECK_TIMEOUT = 8
 
 
 # ============================
-# دیکشنری نام فارسی/انگلیسی ای پرکاربرد
+# دیکشنری نام فارسی/انگلیسی نمادهای پرکاربرد
 # (برای نمادهایی که اینجا نباشن، فقط خود نماد نمایش داده میشه)
 # ============================
 CRYPTO_NAMES = {
@@ -108,20 +111,14 @@ STOCK_NAMES = {
     "DUK": ("Duke Energy Corporation", "دیوک انرژی"), "ZTS": ("Zoetis Inc.", "زوئتیس"),
 }
 
-# نمادهای پرمعامله‌ی بورس تهران (کد L18 که در تسدمتسی استفاده میشه)
-# چون بورس تهران داده‌ی درون‌روزی (۳۰ دقیقه‌ای) آزاد و رسمی نداره، این بخش صرفاً از داده‌ی روزانه استفاده می‌کنه
-TSE_SYMBOLS = {
-    "فولاد": "فولاد مبارکه اصفهان", "فملی": "ملی صنایع مس ایران", "خودرو": "ایران خودرو",
-    "خساپا": "سایپا", "شپنا": "پالایش نفت اصفهان", "شبندر": "پالایش نفت بندرعباس",
-    "فارس": "پتروشیمی فارس", "پارس": "پتروشیمی پارس", "وبملت": "بانک ملت",
-    "وتجارت": "بانک تجارت", "وبصادر": "بانک صادرات ایران", "شستا": "سرمایه‌گذاری تامین اجتماعی",
-    "کگل": "معدنی و صنعتی گل‌گهر", "کچاد": "معدنی و صنعتی چادرملو", "رمپنا": "گروه مپنا",
-    "شتران": "پالایش نفت تهران", "همراه": "ارتباطات سیار ایران", "وغدیر": "سرمایه‌گذاری غدیر",
-    "فخوز": "فولاد خوزستان", "کاوه": "فولاد کاوه جنوب کیش", "نوری": "پتروشیمی نوری",
-    "شپدیس": "پتروشیمی پردیس", "جم": "پتروشیمی جم", "زاگرس": "پتروشیمی زاگرس",
-    "فایرا": "آلومینیوم ایران", "وپاسار": "بانک پاسارگاد", "اخابر": "مخابرات ایران",
-    "شفن": "پتروشیمی فناوران", "کیمیا": "معدنی کیمیای زنجان گستران",
-}
+# نمادهای بورس تهران دیگه ثابت نیستن — هر چرخه با کتابخانه‌ی algotik-tse به‌صورت زنده
+# ۲۰۰ نماد پرحجم‌تر روز از کل بازار استخراج میشن (تابع get_top_tse_symbols پایین‌تر).
+
+# صرافی‌های ایرانی که برای بررسی «آیا این کریپتو در بروکر ایرانی لیست شده» چک میشن
+IRAN_CRYPTO_BROKERS = ["نوبیتکس", "والکس"]
+
+# ردیابی «فاصله‌ی قیمت-EMA» هر نماد بین چرخه‌ها، برای تشخیص نماد مرده (بدون تغییر)
+LAST_DIFF_STATE = {}
 
 
 def log(msg):
@@ -142,6 +139,68 @@ def get_tradingview_link(symbol, market):
     if market == "crypto":
         return f"https://www.tradingview.com/symbols/{quote(symbol)}/?exchange=BINANCE"
     return f"https://www.tradingview.com/symbols/{quote(symbol)}/"
+
+
+def get_binance_link(symbol):
+    """لینک مستقیم صفحه‌ی معامله‌ی نماد در خود بایننس"""
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+        return f"https://www.binance.com/en/trade/{quote(base)}_USDT"
+    return f"https://www.binance.com/en/trade/{quote(symbol)}"
+
+
+def is_symbol_frozen(state_key, diff_percent, tolerance=FROZEN_TOLERANCE):
+    """
+    اگه فاصله‌ی قیمت-EMA این نماد نسبت به چرخه‌ی قبلی عملاً تغییر نکرده باشه،
+    یعنی نماد «مرده»/بدون معامله‌ی واقعیه؛ نباید هر چرخه دوباره هشدار بفرسته.
+    """
+    prev = LAST_DIFF_STATE.get(state_key)
+    LAST_DIFF_STATE[state_key] = diff_percent
+    if prev is None:
+        return False
+    return abs(diff_percent - prev) < tolerance
+
+
+def get_iran_broker_listing(base_currency):
+    """
+    بررسی اینکه آیا این ارز در صرافی‌های معروف ایرانی (نوبیتکس، والکس) لیست شده.
+    این بخش فقط برای نمادهایی که قراره هشدار براشون ارسال بشه صدا زده میشه (حجم کم درخواست).
+    اگه هر صرافی در دسترس نبود، فقط از لیست نتیجه رد میشه (خطای کلی رو نمی‌شکنه).
+    """
+    listed_in = []
+    base_lower = base_currency.lower()
+
+# نوبیتکس
+    try:
+        r = requests.post(
+            "https://api.nobitex.ir/market/stats",
+            json={"srcCurrency": base_lower, "dstCurrency": "usdt"},
+            timeout=IRAN_BROKER_CHECK_TIMEOUT,
+        )
+        data = r.json()
+        if data.get("status") == "ok":
+            stats = data.get("stats", {})
+            key = f"{base_lower}-usdt"
+            if key in stats and stats[key] and not stats[key].get("isClosed", True):
+                listed_in.append("نوبیتکس")
+    except Exception:
+        pass
+
+    # والکس
+    try:
+        r = requests.get("https://api.wallex.ir/hector/web/v1/markets", timeout=IRAN_BROKER_CHECK_TIMEOUT)
+        data = r.json()
+        result = data.get("result", data)
+        symbols_dict = result.get("symbols", result) if isinstance(result, dict) else {}
+        if isinstance(symbols_dict, dict):
+            target = f"{base_currency.upper()}USDT"
+            target_tmn = f"{base_currency.upper()}TMN"
+            if target in symbols_dict or target_tmn in symbols_dict:
+                listed_in.append("والکس")
+    except Exception:
+        pass
+
+    return listed_in
 
 
 def send_telegram_message(text):
@@ -196,20 +255,6 @@ def had_three_red_candles_before_last(opens, closes):
         return False
     for i in (-4, -3, -2):
         if not (closes[i] < opens[i]):
-            return False
-    return True
-
-
-def had_three_red_days_by_close(closes):
-    """
-    برای بورس تهران که 'باز شدن' رسمی هر روز مثل کریپتو معنی نداره،
-    قرمز بودن روز رو بر اساس پایین‌تر بودن قیمت پایانی نسبت به روز قبل می‌سنجیم
-    (همون منطقی که اکثر سکوهای بورس ایران برای رنگ کندل روزانه استفاده می‌کنن).
-    """
-    if len(closes) < 5:
-        return False
-    for i in (-4, -3, -2):
-        if not (closes[i] < closes[i - 1]):
             return False
     return True
 
@@ -312,6 +357,9 @@ def check_crypto_market():
             if had_zero_volume_recently(volumes):
                 continue  # حجم صفر در ۳ کندل قبلی => نماد بی‌کیفیت/غیرفعال
 
+            if is_symbol_frozen(f"crypto:{symbol}", diff_percent):
+                continue  # نماد مرده: فاصله قیمت-EMA نسبت به چرخه قبل تغییر نکرده
+
             daily_df = get_crypto_daily_df(symbol)
             if daily_df is None or len(daily_df) < 4:
                 continue
@@ -324,6 +372,11 @@ def check_crypto_market():
 
             display_name = get_display_name(symbol, CRYPTO_NAMES)
             tv_link = get_tradingview_link(symbol, "crypto")
+            binance_link = get_binance_link(symbol)
+            base_currency = symbol[:-4] if symbol.endswith("USDT") else symbol
+            brokers = get_iran_broker_listing(base_currency)
+            broker_line = f"لیست‌شده در بروکر ایرانی: {', '.join(brokers)}\n" if brokers else ""
+
             caption = (
                 f"🪙 ⚠️ [کریپتو] هشدار ریزش از EMA!\n"
                 f"نماد: {display_name}\n"
@@ -331,7 +384,9 @@ def check_crypto_market():
                 f"قیمت: {current_price}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
-                f"نمودار تردینگ‌ویو: {tv_link}"
+                f"{broker_line}"
+                f"نمودار تردینگ‌ویو: {tv_link}\n"
+                f"نمودار بایننس: {binance_link}"
             )
             log(caption)
 
@@ -381,6 +436,9 @@ def check_us_stocks_market():
             if had_zero_volume_recently(volumes):
                 continue
 
+            if is_symbol_frozen(f"stock:{symbol}", diff_percent):
+                continue  # نماد مرده: فاصله قیمت-EMA نسبت به چرخه قبل تغییر نکرده
+
             daily_data = yf.download(symbol, period="6mo", interval="1d", progress=False)
             if daily_data.empty or len(daily_data) < 4:
                 continue
@@ -420,33 +478,61 @@ def check_us_stocks_market():
 
 
 # ============================
-# بخش بورس تهران (TSETMC) - آزمایشی
+# بخش بورس تهران (TSETMC) - از کتابخانه‌ی مستندسازی‌شده‌ی algotik-tse استفاده میشه
 # ============================
-# توجه: بورس تهران API رسمی و رایگان نداره. اینجا از کتابخانه‌ی غیررسمی «tsetmc» استفاده میشه
-# که ممکنه به‌مرور با تغییرات سایت tsetmc.com از کار بیفته. اگه خطا بده، فقط همین بخش غیرفعال
-# میشه و بقیه‌ی ربات (کریپتو و سهام آمریکا) عادی کار می‌کنه.
-# چون داده‌ی درون‌روزی (۳۰ دقیقه‌ای) رسمی برای بورس تهران در دسترس نیست، همه‌چیز روی
-# تایم‌فریم روزانه محاسبه میشه (هم EMA و هم شرط ۳ کندل قرمز).
+# توجه: بورس تهران API رسمی و رایگان نداره؛ algotik-tse داده رو از tsetmc.com می‌خونه و
+# ممکنه به‌مرور با تغییرات اون سایت از کار بیفته. اگه خطا بده، فقط همین بخش غیرفعال میشه
+# و بقیه‌ی ربات (کریپتو و سهام آمریکا) عادی کار می‌کنه.
+# چون داده‌ی درون‌روزی رسمی و پایدار برای بورس تهران در دسترس نیست، هم EMA و هم شرط
+# ۳ کندل قرمز روی تایم‌فریم روزانه محاسبه میشه. نمادها هر چرخه به‌صورت زنده بر اساس
+# حجم معاملات امروز رتبه‌بندی میشن (نه یه لیست ثابت دستی).
+TSE_STOCK_TYPES = [300, 303, 309]  # کد نوع ابزار برای سهام عادی (بورس/فرابورس)
+
+
+def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
+    """گرفتن اسنپ‌شات لحظه‌ای کل بازار و برگردوندن N نماد پرحجم‌تر (فقط سهام عادی، نه صندوق/اختیار/اوراق)"""
+    import algotik_tse as att
+    data = att.get_market_snapshot()
+    stocks_df = data["stocks"]
+    real = stocks_df[stocks_df["InstrumentType"].isin(TSE_STOCK_TYPES)].copy()
+    real = real.sort_values("Volume", ascending=False)
+    names = dict(zip(real["Symbol"], real["Name"]))
+    top_symbols = real["Symbol"].head(limit).tolist()
+    return top_symbols, names
+
+
 def check_tehran_stocks_market():
     try:
-        from tsetmc.instruments import Instrument
+        import algotik_tse as att
     except Exception as e:
-        log(f"⚠️ کتابخانه‌ی tsetmc در دسترس نیست ({e})؛ اسکن بورس تهران رد شد.")
+        log(f"⚠️ کتابخانه‌ی algotik-tse در دسترس نیست ({e})؛ اسکن بورس تهران رد شد.")
         return
 
-    total = len(TSE_SYMBOLS)
-    log(f"[بورس تهران] {total} نماد پیدا شد.")
+    try:
+        top_symbols, names = get_top_tse_symbols()
+    except Exception as e:
+        log(f"خطا در دریافت اسنپ‌شات بازار بورس تهران: {e}")
+        return
 
-    for index, (l18, fa_full_name) in enumerate(TSE_SYMBOLS.items(), 1):
+    total = len(top_symbols)
+    log(f"[بورس تهران] {total} نماد برتر (بر اساس حجم امروز) پیدا شد.")
+
+    # دریافت دسته‌جمعی ۱۰ روز آخر برای همه‌ی نمادها در یک درخواست (به‌جای ۲۰۰ درخواست جدا)
+    try:
+        hist_all = att.get_history(top_symbols, limit=10, progress=False, dropna=False)
+    except Exception as e:
+        log(f"خطا در دریافت تاریخچه‌ی دسته‌جمعی بورس تهران: {e}")
+        return
+
+    for index, symbol in enumerate(top_symbols, 1):
         try:
-            inst = Instrument.from_l18(l18)
-            page = inst.page_data(trade_history=True)
-            hist = page.get("trade_history")
-            if hist is None or len(hist) < 5:
+            if symbol not in hist_all.columns.get_level_values(1):
                 continue
-            hist = hist.sort_index()
+            opens = hist_all[("Open", symbol)].dropna().tolist()
+            closes = hist_all[("Close", symbol)].dropna().tolist()
+            if len(closes) < 4:
+                continue
 
-            closes = hist["pc"].astype(float).tolist()
             current_price = closes[-1]
             ema_value = calculate_ema(closes, EMA_PERIOD)
             if not ema_value:
@@ -456,21 +542,23 @@ def check_tehran_stocks_market():
             if diff_percent > DIFF_THRESHOLD:
                 continue
 
+            if is_symbol_frozen(f"tse:{symbol}", diff_percent):
+                continue  # نماد مرده: فاصله قیمت-EMA نسبت به چرخه قبل تغییر نکرده
+
             if REQUIRE_RED_CANDLES:
-                if not had_three_red_days_by_close(closes):
+                if not had_three_red_candles_before_last(opens, closes):
                     continue
 
-            daily_df = pd.DataFrame({
-                "Open": hist["py"].astype(float),   # تقریبی: چون «باز شدن» رسمی در این منبع نیست
-                "High": hist["pmax"].astype(float),
-                "Low": hist["pmin"].astype(float),
-                "Close": hist["pc"].astype(float),
-            })
+            # نمودار ۶ ماهه‌ی جداگانه فقط برای نمادی که واجد شرایط شده
+            daily_df = att.get_history(symbol, limit=180, progress=False)
+            if daily_df is None or len(daily_df) < 4:
+                continue
 
+            fa_full_name = names.get(symbol, "")
             caption = (
                 f"🇮🇷 ⚠️ [بورس تهران] هشدار ریزش از EMA!\n"
-                f"نماد: {l18} ({fa_full_name})\n"
-                f"تایم‌فریم: روزانه (داده درون‌روزی برای بورس تهران در دسترس نیست)\n"
+                f"نماد: {symbol} ({fa_full_name})\n"
+                f"تایم‌فریم: روزانه (داده درون‌روزی رسمی برای بورس تهران در دسترس نیست)\n"
                 f"قیمت پایانی: {current_price}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
@@ -478,17 +566,16 @@ def check_tehran_stocks_market():
             )
             log(caption)
 
-            chart = make_candlestick_chart(daily_df, title=f"{l18} - Daily")
+            chart = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
             if chart:
                 send_telegram_photo(chart, caption)
             else:
                 send_telegram_message(caption)
         except Exception as e:
-            log(f"خطا در پردازش نماد بورس تهران {l18}: {e}")
+            log(f"خطا در پردازش نماد بورس تهران {symbol}: {e}")
 
-        if index % 10 == 0:
+        if index % 40 == 0:
             log(f"[بورس تهران] {index}/{total} اسکن شد...")
-        time.sleep(0.3)
 
 
 # ============================
