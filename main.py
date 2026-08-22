@@ -16,7 +16,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدور هشدار
+DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدورر هشدار
 REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز روزانه قبل از کندل فعلی
 CYCLE_SECONDS = 300          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
 REQUEST_TIMEOUT = 15
