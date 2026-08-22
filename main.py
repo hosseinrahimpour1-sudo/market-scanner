@@ -17,7 +17,9 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
 DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدور هشدار
-REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز روزانه قبل از کندل فعلی
+REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
+RED_CANDLE_TIMEFRAME = "daily"  # تایم‌فریم شرط ۳ کندل قرمز: "daily" یا "30m" (فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily)
+DONCHIAN_PERIOD = 20         # دوره‌ی استاندارد اندیکاتور Donchian Channel
 CYCLE_SECONDS = 300          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
 REQUEST_TIMEOUT = 15
 CRYPTO_RANK_LIMIT = 300      # فقط ۳۰۰ ارز برتر بر اساس حجم معاملات ۲۴ ساعته (رنک نقدشوندگی)
@@ -280,7 +282,7 @@ def had_zero_volume_recently(volumes):
 
 
 def make_candlestick_chart(df, title=""):
-    """ساخت تصویر کوچیک نمودار شمعی از دیتافریم OHLC و برگردوندن به‌صورت بایت"""
+    """ساخت تصویر کوچیک نمودار شمعی ساده (بدون اندیکاتور) از دیتافریم OHLC"""
     buf = io.BytesIO()
     try:
         mpf.plot(
@@ -296,6 +298,51 @@ def make_candlestick_chart(df, title=""):
         return buf
     except Exception as e:
         log(f"خطا در ساخت نمودار: {e}")
+        return None
+
+
+def calculate_ema_series(close_series, period=EMA_PERIOD):
+    """محاسبه‌ی سری کامل EMA (برای رسم روی نمودار، نه فقط عدد نهایی)"""
+    return close_series.ewm(span=period, adjust=False).mean()
+
+
+def calculate_donchian(df, period=DONCHIAN_PERIOD):
+    """محاسبه‌ی باندهای بالا/پایین اندیکاتور استاندارد Donchian Channel"""
+    upper = df["High"].rolling(window=period, min_periods=1).max()
+    lower = df["Low"].rolling(window=period, min_periods=1).min()
+    return upper, lower
+
+
+def make_indicator_chart(df, title="", show_ema=True, show_donchian=False):
+    """
+    نسخه‌ی پیشرفته‌ی نمودار شمعی که می‌تونه خط EMA5 و/یا باندهای Donchian Channel
+    رو هم روی خود نمودار رسم کنه. برای نمودارهای درون‌روزی (۳۰ و ۱۵ دقیقه) استفاده میشه.
+    """
+    buf = io.BytesIO()
+    try:
+        addplots = []
+        if show_ema and len(df) >= 2:
+            ema_series = calculate_ema_series(df["Close"], EMA_PERIOD)
+            addplots.append(mpf.make_addplot(ema_series, color="blue", width=1.0))
+        if show_donchian and len(df) >= 2:
+            upper, lower = calculate_donchian(df, DONCHIAN_PERIOD)
+            addplots.append(mpf.make_addplot(upper, color="green", width=0.8))
+            addplots.append(mpf.make_addplot(lower, color="red", width=0.8))
+
+        mpf.plot(
+            df,
+            type="candle",
+            style="charles",
+            volume=False,
+            title=title,
+            figsize=(5, 3.2),
+            addplot=addplots if addplots else None,
+            savefig=dict(fname=buf, dpi=90, bbox_inches="tight"),
+        )
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        log(f"خطا در ساخت نمودار اندیکاتور: {e}")
         return None
 
 
@@ -342,8 +389,29 @@ def get_crypto_daily_df(symbol, limit=180):
         return None
 
 
+def get_crypto_intraday_df(symbol, interval, limit):
+    """گرفتن دیتافریم OHLC درون‌روزی (۳۰ دقیقه یا ۱۵ دقیقه) برای نمودارهای اضافی"""
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT).json()
+        if not isinstance(response, list) or len(response) == 0:
+            return None
+        df = pd.DataFrame(response, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"
+        ])
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("open_time", inplace=True)
+        df = df[["open", "high", "low", "close"]].astype(float)
+        df.columns = ["Open", "High", "Low", "Close"]
+        return df
+    except Exception as e:
+        log(f"خطا در دریافت دیتای {interval} برای {symbol}: {e}")
+        return None
+
+
 def check_crypto_market():
-    """اسکن بازار کریپتو (بایننس) - کندل ۳۰ دقیقه‌ای برای EMA، کندل روزانه برای شرط ۳ کندل قرمز"""
+    """اسکن بازار کریپتو (بایننس) - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_TIMEFRAME"""
     symbols = get_top_ranked_usdt_symbols()
     total = len(symbols)
     log(f"[کریپتو] {total} ارز برتر (بر اساس حجم ۲۴ ساعته) پیدا شد.")
@@ -355,8 +423,10 @@ def check_crypto_market():
             if not isinstance(response, list) or len(response) < 4:
                 continue
 
+            opens30 = [float(c[1]) for c in response]
             closes = [float(c[4]) for c in response]
             volumes = [float(c[5]) for c in response]
+            quote_values = [float(c[7]) for c in response]  # ارزش معامله‌شده (به USDT) هر کندل
             current_price = closes[-1]
             ema_value = calculate_ema(closes, EMA_PERIOD)
             if not ema_value:
@@ -377,9 +447,13 @@ def check_crypto_market():
                 continue
 
             if REQUIRE_RED_CANDLES:
-                if not had_three_red_candles_before_last(
-                    daily_df["Open"].tolist(), daily_df["Close"].tolist()
-                ):
+                if RED_CANDLE_TIMEFRAME == "30m":
+                    red_check_ok = had_three_red_candles_before_last(opens30, closes)
+                else:
+                    red_check_ok = had_three_red_candles_before_last(
+                        daily_df["Open"].tolist(), daily_df["Close"].tolist()
+                    )
+                if not red_check_ok:
                     continue
 
             display_name = get_display_name(symbol, CRYPTO_NAMES)
@@ -389,24 +463,51 @@ def check_crypto_market():
             brokers = get_iran_broker_listing(base_currency)
             broker_line = f"لیست‌شده در بروکر ایرانی: {', '.join(brokers)}\n" if brokers else ""
 
+            last_volume = volumes[-1]
+            last_value = quote_values[-1]
+
             caption = (
                 f"🪙 ⚠️ [کریپتو] هشدار ریزش از EMA!\n"
                 f"نماد: {display_name}\n"
-                f"تایم‌فریم EMA: 30m | تایم‌فریم کندل قرمز: روزانه\n"
+                f"تایم‌فریم EMA: 30m | تایم‌فریم کندل قرمز: {RED_CANDLE_TIMEFRAME}\n"
                 f"قیمت: {current_price}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
+                f"حجم کندل آخر (30m): {last_volume:,.2f} {base_currency}\n"
+                f"ارزش کندل آخر (30m): {last_value:,.2f} USDT\n"
                 f"{broker_line}"
                 f"نمودار تردینگ‌ویو: {tv_link}\n"
                 f"نمودار بایننس: {binance_link}"
             )
             log(caption)
 
-            chart = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
-            if chart:
-                send_telegram_photo(chart, caption)
+            chart_6m = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
+            if chart_6m:
+                send_telegram_photo(chart_6m, caption)
             else:
                 send_telegram_message(caption)
+
+            intraday_30m_df = get_crypto_intraday_df(symbol, "30m", 50)
+            if intraday_30m_df is not None:
+                chart_30m = make_indicator_chart(
+                    intraday_30m_df, title=f"{symbol} - 1D 30m + EMA{EMA_PERIOD}", show_ema=True
+                )
+                if chart_30m:
+                    send_telegram_photo(chart_30m, f"⏱ {symbol} - نمودار ۱ روزه، تایم‌فریم ۳۰ دقیقه + EMA{EMA_PERIOD}")
+
+            intraday_15m_df = get_crypto_intraday_df(symbol, "15m", 120)
+            if intraday_15m_df is not None:
+                chart_15m = make_indicator_chart(
+                    intraday_15m_df,
+                    title=f"{symbol} - 1D 15m + EMA{EMA_PERIOD} + DC{DONCHIAN_PERIOD}",
+                    show_ema=True,
+                    show_donchian=True,
+                )
+                if chart_15m:
+                    send_telegram_photo(
+                        chart_15m,
+                        f"⏱ {symbol} - نمودار ۱ روزه، تایم‌فریم ۱۵ دقیقه + EMA{EMA_PERIOD} + Donchian Channel({DONCHIAN_PERIOD})",
+                    )
         except Exception as e:
             log(f"خطا در پردازش {symbol}: {e}")
 
@@ -423,7 +524,7 @@ def get_top100_us_symbols():
 
 
 def check_us_stocks_market():
-    """اسکن ۱۰۰ شرکت بزرگ آمریکا - کندل ۳۰ دقیقه‌ای برای EMA، کندل روزانه برای شرط ۳ کندل قرمز"""
+    """اسکن ۱۰۰ شرکت بزرگ آمریکا - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_TIMEFRAME"""
     symbols = get_top100_us_symbols()
     total = len(symbols)
     log(f"[سهام] {total} نماد پیدا شد.")
@@ -434,6 +535,7 @@ def check_us_stocks_market():
             if data30.empty or len(data30) < EMA_PERIOD or len(data30) < 4:
                 continue
 
+            opens30 = data30["Open"].values.flatten().tolist()
             closes = data30["Close"].values.flatten().tolist()
             volumes = data30["Volume"].values.flatten().tolist()
             current_price = closes[-1]
@@ -457,30 +559,72 @@ def check_us_stocks_market():
             daily_df = daily_data[["Open", "High", "Low", "Close"]].copy()
 
             if REQUIRE_RED_CANDLES:
-                if not had_three_red_candles_before_last(
-                    daily_df["Open"].values.flatten().tolist(),
-                    daily_df["Close"].values.flatten().tolist(),
-                ):
+                if RED_CANDLE_TIMEFRAME == "30m":
+                    red_check_ok = had_three_red_candles_before_last(opens30, closes)
+                else:
+                    red_check_ok = had_three_red_candles_before_last(
+                        daily_df["Open"].values.flatten().tolist(),
+                        daily_df["Close"].values.flatten().tolist(),
+                    )
+                if not red_check_ok:
                     continue
 
             display_name = get_display_name(symbol, STOCK_NAMES)
             tv_link = get_tradingview_link(symbol, "stock")
+
+            last_volume = volumes[-1]
+            last_value = last_volume * current_price  # ارزش تقریبی (حجم × قیمت)
+
             caption = (
                 f"📈 ⚠️ [سهام آمریکا] هشدار ریزش از EMA!\n"
                 f"نماد: {display_name}\n"
-                f"تایم‌فریم EMA: 30m | تایم‌فریم کندل قرمز: روزانه\n"
+                f"تایم‌فریم EMA: 30m | تایم‌فریم کندل قرمز: {RED_CANDLE_TIMEFRAME}\n"
                 f"قیمت: {current_price:.2f}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
+                f"حجم کندل آخر (30m): {last_volume:,.0f} سهم\n"
+                f"ارزش تقریبی کندل آخر (30m): {last_value:,.2f} $\n"
                 f"نمودار تردینگ‌ویو: {tv_link}"
             )
             log(caption)
 
-            chart = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
-            if chart:
-                send_telegram_photo(chart, caption)
+            chart_6m = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
+            if chart_6m:
+                send_telegram_photo(chart_6m, caption)
             else:
                 send_telegram_message(caption)
+
+            try:
+                intraday_30m_df = yf.download(symbol, period="1d", interval="30m", progress=False)[
+                    ["Open", "High", "Low", "Close"]
+                ]
+                if not intraday_30m_df.empty:
+                    chart_30m = make_indicator_chart(
+                        intraday_30m_df, title=f"{symbol} - 1D 30m + EMA{EMA_PERIOD}", show_ema=True
+                    )
+                    if chart_30m:
+                        send_telegram_photo(chart_30m, f"⏱ {symbol} - نمودار ۱ روزه، تایم‌فریم ۳۰ دقیقه + EMA{EMA_PERIOD}")
+            except Exception as e:
+                log(f"خطا در ساخت نمودار ۳۰ دقیقه {symbol}: {e}")
+
+            try:
+                intraday_15m_df = yf.download(symbol, period="1d", interval="15m", progress=False)[
+                    ["Open", "High", "Low", "Close"]
+                ]
+                if not intraday_15m_df.empty:
+                    chart_15m = make_indicator_chart(
+                        intraday_15m_df,
+                        title=f"{symbol} - 1D 15m + EMA{EMA_PERIOD} + DC{DONCHIAN_PERIOD}",
+                        show_ema=True,
+                        show_donchian=True,
+                    )
+                    if chart_15m:
+                        send_telegram_photo(
+                            chart_15m,
+                            f"⏱ {symbol} - نمودار ۱ روزه، تایم‌فریم ۱۵ دقیقه + EMA{EMA_PERIOD} + Donchian Channel({DONCHIAN_PERIOD})",
+                        )
+            except Exception as e:
+                log(f"خطا در ساخت نمودار ۱۵ دقیقه {symbol}: {e}")
         except Exception as e:
             log(f"خطا در پردازش {symbol}: {e}")
 
