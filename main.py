@@ -11,8 +11,8 @@ import mplfinance as mpf
 # ============================
 # تنظیمات اصلی
 # ============================
-TOKEN = os.environ.get("8668166398:AAGC6ghQk6w7-4WPKG7BBowDsSNA364TC0E")
-CHAT_ID = os.environ.get("111531946")
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
 DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدور هشدار
