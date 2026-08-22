@@ -16,14 +16,16 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدورر هشدار
+DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدور هشدار
 REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز روزانه قبل از کندل فعلی
 CYCLE_SECONDS = 300          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
 REQUEST_TIMEOUT = 15
 CRYPTO_RANK_LIMIT = 300      # فقط ۳۰۰ ارز برتر بر اساس حجم معاملات ۲۴ ساعته (رنک نقدشوندگی)
 TSE_RANK_LIMIT = 200         # فقط ۲۰۰ نماد برتر بورس تهران بر اساس حجم معاملات امروز
-FROZEN_TOLERANCE = 0.0001    # اگه فاصله قیمت-EMA به این میزان یا کمتر تغییر کنه، نماد "مرده" حساب میشه
+FROZEN_TOLERANCE = 1.0       # تغییر کمتر از این (واحد: درصد) یعنی هنوز همون سیگنال قبلیه، نه یه افت جدید
+ALERT_COOLDOWN_SECONDS = 6 * 3600  # بعد از هر هشدار، حداقل ۶ ساعت برای همون نماد دوباره هشدار نده
 IRAN_BROKER_CHECK_TIMEOUT = 8
+
 
 # ============================
 # دیکشنری نام فارسی/انگلیسی نمادهای پرکاربرد
@@ -116,8 +118,9 @@ STOCK_NAMES = {
 # صرافی‌های ایرانی که برای بررسی «آیا این کریپتو در بروکر ایرانی لیست شده» چک میشن
 IRAN_CRYPTO_BROKERS = ["نوبیتکس", "والکس"]
 
-# ردیابی «فاصله‌ی قیمت-EMA» هر نماد بین چرخه‌ها، برای تشخیص نماد مرده (بدون تغییر)
-LAST_DIFF_STATE = {}
+# ردیابی «آخرین هشدار» هر نماد (فاصله قیمت-EMA + زمان)، برای جلوگیری از اسپم روی نماد تکراری/مرده
+LAST_ALERT_STATE = {}
+
 
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
@@ -147,16 +150,27 @@ def get_binance_link(symbol):
     return f"https://www.binance.com/en/trade/{quote(symbol)}"
 
 
-def is_symbol_frozen(state_key, diff_percent, tolerance=FROZEN_TOLERANCE):
+def should_suppress_repeat_alert(state_key, diff_percent):
     """
-    اگه فاصله‌ی قیمت-EMA این نماد نسبت به چرخه‌ی قبلی عملاً تغییر نکرده باشه،
-    یعنی نماد «مرده»/بدون معامله‌ی واقعیه؛ نباید هر چرخه دوباره هشدار بفرسته.
+    جلوگیری از اسپم روی یه نماد: بعد از هر هشدار، تا مدت ALERT_COOLDOWN_SECONDS
+    دوباره هشدار نمیده -- مگر اینکه فاصله‌ی قیمت-EMA به‌طور معناداری (بیشتر از
+    FROZEN_TOLERANCE واحد درصد) نسبت به آخرین هشدار تغییر کرده باشه، که یعنی
+    واقعاً وضعیت جدیدیه و نه فقط تکرار همون افت قبلی یا نوسان جزئی نماد بی‌حجم.
     """
-    prev = LAST_DIFF_STATE.get(state_key)
-    LAST_DIFF_STATE[state_key] = diff_percent
+    now = time.time()
+    prev = LAST_ALERT_STATE.get(state_key)
     if prev is None:
+        LAST_ALERT_STATE[state_key] = {"diff": diff_percent, "time": now}
         return False
-    return abs(diff_percent - prev) < tolerance
+
+    time_since_last = now - prev["time"]
+    diff_change = abs(diff_percent - prev["diff"])
+
+    if time_since_last < ALERT_COOLDOWN_SECONDS and diff_change < FROZEN_TOLERANCE:
+        return True  # هنوز کول‌داون فعاله و تغییر معناداری هم نبوده -> رد میشه
+
+    LAST_ALERT_STATE[state_key] = {"diff": diff_percent, "time": now}
+    return False
 
 
 def get_iran_broker_listing(base_currency):
@@ -168,7 +182,7 @@ def get_iran_broker_listing(base_currency):
     listed_in = []
     base_lower = base_currency.lower()
 
-# نوبیتکس
+    # نوبیتکس
     try:
         r = requests.post(
             "https://api.nobitex.ir/market/stats",
@@ -355,8 +369,8 @@ def check_crypto_market():
             if had_zero_volume_recently(volumes):
                 continue  # حجم صفر در ۳ کندل قبلی => نماد بی‌کیفیت/غیرفعال
 
-            if is_symbol_frozen(f"crypto:{symbol}", diff_percent):
-                continue  # نماد مرده: فاصله قیمت-EMA نسبت به چرخه قبل تغییر نکرده
+            if should_suppress_repeat_alert(f"crypto:{symbol}", diff_percent):
+                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
 
             daily_df = get_crypto_daily_df(symbol)
             if daily_df is None or len(daily_df) < 4:
@@ -434,8 +448,8 @@ def check_us_stocks_market():
             if had_zero_volume_recently(volumes):
                 continue
 
-            if is_symbol_frozen(f"stock:{symbol}", diff_percent):
-                continue  # نماد مرده: فاصله قیمت-EMA نسبت به چرخه قبل تغییر نکرده
+            if should_suppress_repeat_alert(f"stock:{symbol}", diff_percent):
+                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
 
             daily_data = yf.download(symbol, period="6mo", interval="1d", progress=False)
             if daily_data.empty or len(daily_data) < 4:
@@ -540,8 +554,8 @@ def check_tehran_stocks_market():
             if diff_percent > DIFF_THRESHOLD:
                 continue
 
-            if is_symbol_frozen(f"tse:{symbol}", diff_percent):
-                continue  # نماد مرده: فاصله قیمت-EMA نسبت به چرخه قبل تغییر نکرده
+            if should_suppress_repeat_alert(f"tse:{symbol}", diff_percent):
+                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
 
             if REQUIRE_RED_CANDLES:
                 if not had_three_red_candles_before_last(opens, closes):
