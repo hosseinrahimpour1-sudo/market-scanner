@@ -1,2 +1,5 @@
 requests
 yfinance
+pandas
+mplfinance
+
