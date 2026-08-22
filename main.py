@@ -16,11 +16,11 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدور هشدار
-REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
+DIFF_THRESHOLD = -3          # درصد افت از EMA برای صدور هشدار
+REQUIRE_RED_CANDLES = False  # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
 RED_CANDLE_TIMEFRAME = "daily"  # تایم‌فریم شرط ۳ کندل قرمز: "daily" یا "30m" (فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily)
 DONCHIAN_PERIOD = 20         # دوره‌ی استاندارد اندیکاتور Donchian Channel
-CYCLE_SECONDS = 300          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
+CYCLE_SECONDS = 180          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
 REQUEST_TIMEOUT = 15
 CRYPTO_RANK_LIMIT = 300      # فقط ۳۰۰ ارز برتر بر اساس حجم معاملات ۲۴ ساعته (رنک نقدشوندگی)
 TSE_RANK_LIMIT = 200         # فقط ۲۰۰ نماد برتر بورس تهران بر اساس حجم معاملات امروز
