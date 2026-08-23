@@ -28,8 +28,6 @@ FROZEN_TOLERANCE = 1.0       # تغییر کمتر از این (واحد: درص
 ALERT_COOLDOWN_SECONDS = 6 * 3600  # بعد از هر هشدار، حداقل ۶ ساعت برای همون نماد دوباره هشدار نده
 IRAN_BROKER_CHECK_TIMEOUT = 8
 
-
-
 # ============================
 # دیکشنری نام فارسی/انگلیسی نمادهای پرکاربرد
 # (برای نمادهایی که اینجا نباشن، فقط خود نماد نمایش داده میشه)
@@ -124,10 +122,8 @@ IRAN_CRYPTO_BROKERS = ["نوبیتکس", "والکس"]
 # ردیابی «آخرین هشدار» هر نماد (فاصله قیمت-EMA + زمان)، برای جلوگیری از اسپم روی نماد تکراری/مرده
 LAST_ALERT_STATE = {}
 
-
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
-
 
 def get_display_name(symbol, names_dict):
     """برگردوندن رشته‌ی 'نماد (اسم انگلیسی | اسم فارسی)' یا فقط خود نماد اگه پیدا نشد"""
@@ -137,13 +133,11 @@ def get_display_name(symbol, names_dict):
         return f"{symbol} ({en} | {fa})"
     return symbol
 
-
 def get_tradingview_link(symbol, market):
     """لینک واقعی و تست‌شده‌ی صفحه‌ی نماد در تردینگ‌ویو"""
     if market == "crypto":
         return f"https://www.tradingview.com/symbols/{quote(symbol)}/?exchange=BINANCE"
     return f"https://www.tradingview.com/symbols/{quote(symbol)}/"
-
 
 def get_binance_link(symbol):
     """لینک مستقیم صفحه‌ی معامله‌ی نماد در خود بایننس"""
@@ -151,7 +145,6 @@ def get_binance_link(symbol):
         base = symbol[:-4]
         return f"https://www.binance.com/en/trade/{quote(base)}_USDT"
     return f"https://www.binance.com/en/trade/{quote(symbol)}"
-
 
 def should_suppress_repeat_alert(state_key, diff_percent):
     """
@@ -174,7 +167,6 @@ def should_suppress_repeat_alert(state_key, diff_percent):
 
     LAST_ALERT_STATE[state_key] = {"diff": diff_percent, "time": now}
     return False
-
 
 def get_iran_broker_links(base_currency):
     """
@@ -221,7 +213,6 @@ def get_iran_broker_links(base_currency):
 
     return listed_in
 
-
 def send_telegram_message(text):
     """ارسال پیام متنی به تلگرام"""
     if not TOKEN or not CHAT_ID:
@@ -234,7 +225,6 @@ def send_telegram_message(text):
             log(f"خطای تلگرام (sendMessage): {r.status_code} - {r.text[:200]}")
     except Exception as e:
         log(f"خطا در ارسال پیام تلگرام: {e}")
-
 
 def send_telegram_photo(image_bytes, caption):
     """ارسال عکس (نمودار شمعی) همراه با کپشن به تلگرام"""
@@ -253,7 +243,6 @@ def send_telegram_photo(image_bytes, caption):
         log(f"خطا در ارسال عکس: {e}")
         send_telegram_message(caption)
 
-
 def calculate_ema(prices, period):
     """محاسبه ریاضی اندیکاتور EMA"""
     if len(prices) < period:
@@ -263,7 +252,6 @@ def calculate_ema(prices, period):
     for price in prices[period:]:
         ema = (price - ema) * multiplier + ema
     return ema
-
 
 def had_three_red_candles_before_last(opens, closes):
     """
@@ -277,7 +265,6 @@ def had_three_red_candles_before_last(opens, closes):
             return False
     return True
 
-
 def had_zero_volume_recently(volumes):
     """بررسی اینکه آیا در ۳ کندل قبل از کندل فعلی حجم صفر بوده"""
     if len(volumes) < 4:
@@ -285,11 +272,9 @@ def had_zero_volume_recently(volumes):
     vols_before = volumes[-4:-1]
     return any(v == 0 for v in vols_before)
 
-
 def calculate_ema_series(close_series, period=EMA_PERIOD):
     """محاسبه‌ی سری کامل EMA (برای رسم روی نمودار، نه فقط عدد نهایی)"""
     return close_series.ewm(span=period, adjust=False).mean()
-
 
 def calculate_fibonacci_pivots(prev_high, prev_low, prev_close):
     """محاسبه‌ی سطوح پیوت استاندارد در حالت فیبوناچی، بر اساس High/Low/Close روز قبل"""
@@ -300,7 +285,6 @@ def calculate_fibonacci_pivots(prev_high, prev_low, prev_close):
         "R1": pp + 0.382 * diff, "R2": pp + 0.618 * diff, "R3": pp + 1.000 * diff,
         "S1": pp - 0.382 * diff, "S2": pp - 0.618 * diff, "S3": pp - 1.000 * diff,
     }
-
 
 def compute_pivot_series(intraday_index, daily_df):
     """
@@ -326,14 +310,12 @@ def compute_pivot_series(intraday_index, daily_df):
             levels[k].append(p[k] if p else float("nan"))
     return {k: pd.Series(v, index=intraday_index) for k, v in levels.items()}
 
-
 # رنگ‌های واضح‌تر برای پیوت (PP قبلاً نارنجی/زرد کم‌رنگ بود و دیده نمی‌شد؛ الان بنفش پررنگ)
 PIVOT_COLORS = {
     "PP": "#800080",
     "R1": "#ff6666", "R2": "#ff0000", "R3": "#990000",
     "S1": "#66cc66", "S2": "#00aa00", "S3": "#006600",
 }
-
 
 def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivots=False):
     """
@@ -375,7 +357,6 @@ def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivo
         log(f"خطا در ساخت نمودار اندیکاتور ({title}): {e}")
         return None
 
-
 def make_candlestick_chart(df, title=""):
     """ساخت تصویر کوچیک نمودار شمعی ساده (بدون اندیکاتور) از دیتافریم OHLC"""
     buf = io.BytesIO()
@@ -394,7 +375,6 @@ def make_candlestick_chart(df, title=""):
     except Exception as e:
         log(f"خطا در ساخت نمودار: {e}")
         return None
-
 
 # ============================
 # بخش کریپتو (بایننس)
@@ -438,7 +418,6 @@ def get_crypto_daily_df(symbol, limit=180):
         log(f"خطا در دریافت دیتای روزانه {symbol}: {e}")
         return None
 
-
 def get_crypto_intraday_df(symbol, interval, limit):
     """گرفتن دیتافریم OHLC درون‌روزی (۳۰ دقیقه یا ۱۵ دقیقه) برای نمودارهای اضافی"""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
@@ -458,7 +437,6 @@ def get_crypto_intraday_df(symbol, interval, limit):
     except Exception as e:
         log(f"خطا در دریافت دیتای {interval} برای {symbol}: {e}")
         return None
-
 
 def check_crypto_market():
     """اسکن بازار کریپتو (بایننس) - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_USE_DAILY"""
@@ -572,13 +550,11 @@ def check_crypto_market():
             log(f"[کریپتو] {index}/{total} اسکن شد...")
         time.sleep(0.15)
 
-
 # ============================
 # بخش سهام آمریکا (Yahoo Finance)
 # ============================
 def get_top100_us_symbols():
     return list(STOCK_NAMES.keys())
-
 
 def check_us_stocks_market():
     """اسکن ۱۰۰ شرکت بزرگ آمریکا - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_USE_DAILY"""
@@ -691,7 +667,6 @@ def check_us_stocks_market():
             log(f"[سهام] {index}/{total} اسکن شد...")
         time.sleep(0.15)
 
-
 # ============================
 # بخش بورس تهران (TSETMC) - دو منبع مستقل برای اطمینان بیشتر
 # ============================
@@ -703,7 +678,6 @@ def check_us_stocks_market():
 # چون داده‌ی درون‌روزی رسمی و پایدار برای بورس تهران در دسترس نیست، هم EMA و هم شرط
 # ۳ کندل قرمز همیشه روی تایم‌فریم روزانه محاسبه میشه.
 TSE_STOCK_TYPES = [300, 303, 309]  # کد نوع ابزار برای سهام عادی (بورس/فرابورس)
-
 
 def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
     """
@@ -760,7 +734,6 @@ def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
     log(f"[بورس تهران] در مجموع {len(top_symbols)} از {limit} نماد هدف آماده شد.")
     return top_symbols, names
 
-
 def get_tse_daily_df_fallback(symbol, limit=180):
     """
     منبع دوم (pytse-client) و در صورت شکست، منبع سوم (finpy-tse) برای گرفتن
@@ -796,7 +769,6 @@ def get_tse_daily_df_fallback(symbol, limit=180):
         log(f"خطا در منبع سوم (finpy-tse) برای {symbol}: {e}")
 
     return None
-
 
 def check_tehran_stocks_market():
     try:
@@ -891,7 +863,6 @@ def check_tehran_stocks_market():
 
         if index % 40 == 0:
             log(f"[بورس تهران] {index}/{total} اسکن شد...")
-
 
 # ============================
 # حلقه اصلی برنامه
