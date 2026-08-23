@@ -4,3 +4,5 @@ pandas
 mplfinance
 algotik-tse
 pytse-client
+finpy-tse
+
