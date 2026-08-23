@@ -16,11 +16,10 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -1          # درصد افت از EMA برای صدور هشدار
+DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدور هشدار
 REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
-RED_CANDLE_USE_DAILY = False  # True = شرط روی کندل روزانه | False = شرط روی کندل ۳۰ دقیقه (فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily)
-DONCHIAN_PERIOD = 20         # دوره‌ی استاندارد اندیکاتور Donchian Channel
-INTRADAY_DISPLAY_DAYS = 3    # تعداد روزهایی که توی نمودارهای ۳۰ و ۱۵ دقیقه‌ای نمایش داده میشه
+RED_CANDLE_USE_DAILY = False # True = شرط روی کندل روزانه | False = شرط روی کندل ۳۰ دقیقه (پیش‌فرض) -- فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily
+INTRADAY_DISPLAY_DAYS = 2    # تعداد روزهایی که توی نمودارهای ۳۰ و ۱۵ دقیقه‌ای نمایش داده میشه
 CYCLE_SECONDS = 300          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
 REQUEST_TIMEOUT = 15
 CRYPTO_RANK_LIMIT = 300      # فقط ۳۰۰ ارز برتر بر اساس حجم معاملات ۲۴ ساعته (رنک نقدشوندگی)
@@ -292,13 +291,6 @@ def calculate_ema_series(close_series, period=EMA_PERIOD):
     return close_series.ewm(span=period, adjust=False).mean()
 
 
-def calculate_donchian(df, period=DONCHIAN_PERIOD):
-    """محاسبه‌ی باندهای بالا/پایین اندیکاتور استاندارد Donchian Channel"""
-    upper = df["High"].rolling(window=period, min_periods=1).max()
-    lower = df["Low"].rolling(window=period, min_periods=1).min()
-    return upper, lower
-
-
 def calculate_fibonacci_pivots(prev_high, prev_low, prev_close):
     """محاسبه‌ی سطوح پیوت استاندارد در حالت فیبوناچی، بر اساس High/Low/Close روز قبل"""
     pp = (prev_high + prev_low + prev_close) / 3
@@ -335,30 +327,27 @@ def compute_pivot_series(intraday_index, daily_df):
     return {k: pd.Series(v, index=intraday_index) for k, v in levels.items()}
 
 
+# رنگ‌های واضح‌تر برای پیوت (PP قبلاً نارنجی/زرد کم‌رنگ بود و دیده نمی‌شد؛ الان بنفش پررنگ)
 PIVOT_COLORS = {
-    "PP": "orange",
-    "R1": "#ff9999", "R2": "#ff6666", "R3": "#ff3333",
-    "S1": "#99dd99", "S2": "#66cc66", "S3": "#33aa33",
+    "PP": "#800080",
+    "R1": "#ff6666", "R2": "#ff0000", "R3": "#990000",
+    "S1": "#66cc66", "S2": "#00aa00", "S3": "#006600",
 }
-
 
 
 def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivots=False):
     """
-    نمودار شمعی با EMA5 + Donchian Channel(20) + (اختیاری) پیوت فیبوناچی روزانه.
+    نمودار شمعی با EMA5 + (اختیاری) پیوت فیبوناچی روزانه.
     اندیکاتورها روی کل df_full حساب میشن (برای دقت لبه‌ها) و در آخر فقط display_bars
     کندل آخر نمایش داده میشه.
     """
     buf = io.BytesIO()
     try:
         ema_series = calculate_ema_series(df_full["Close"], EMA_PERIOD)
-        upper, lower = calculate_donchian(df_full, DONCHIAN_PERIOD)
 
         df_display = df_full.tail(display_bars)
         addplots = [
-            mpf.make_addplot(ema_series.tail(display_bars), color="blue", width=1.0),
-            mpf.make_addplot(upper.tail(display_bars), color="green", width=0.8),
-            mpf.make_addplot(lower.tail(display_bars), color="red", width=0.8),
+            mpf.make_addplot(ema_series.tail(display_bars), color="blue", width=1.2),
         ]
 
         if show_pivots and daily_df is not None and len(daily_df) > 0:
@@ -366,7 +355,7 @@ def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivo
             for level, series in pivots.items():
                 addplots.append(
                     mpf.make_addplot(
-                        series.tail(display_bars), color=PIVOT_COLORS[level], width=0.6, linestyle="--"
+                        series.tail(display_bars), color=PIVOT_COLORS[level], width=0.9, linestyle="--"
                     )
                 )
 
@@ -500,9 +489,6 @@ def check_crypto_market():
             if had_zero_volume_recently(volumes):
                 continue  # حجم صفر در ۳ کندل قبلی => نماد بی‌کیفیت/غیرفعال
 
-            if should_suppress_repeat_alert(f"crypto:{symbol}", diff_percent):
-                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
-
             daily_df = get_crypto_daily_df(symbol)
             if daily_df is None or len(daily_df) < 4:
                 continue
@@ -516,6 +502,13 @@ def check_crypto_market():
                     red_check_ok = had_three_red_candles_before_last(opens30, closes)
                 if not red_check_ok:
                     continue
+
+            # این چک باید آخرین مرحله باشه: فقط وقتی همه‌ی شرایط برقرارن و قراره واقعاً
+            # هشدار ارسال بشه، وضعیت کول‌داون ثبت/چک میشه -- وگرنه یه نماد که فقط شرط
+            # EMA رو داره ولی شرط کندل قرمز رو نداره، اشتباهی «هشدار داده شده» ثبت میشه
+            # و جلوی هشدار واقعی بعدی رو می‌گیره.
+            if should_suppress_repeat_alert(f"crypto:{symbol}", diff_percent):
+                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
 
             display_name = get_display_name(symbol, CRYPTO_NAMES)
             tv_link = get_tradingview_link(symbol, "crypto")
@@ -548,7 +541,7 @@ def check_crypto_market():
             if chart_6m:
                 send_telegram_photo(chart_6m, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
 
-            # ۲- نمودار ۳۰ دقیقه‌ای، ۳ روز اخیر + EMA5 + Donchian + پیوت فیبوناچی
+            # ۲- نمودار ۳۰ دقیقه‌ای، ۲ روز اخیر + EMA5 + پیوت فیبوناچی
             buf_30m = get_crypto_intraday_df(symbol, "30m", 48 * INTRADAY_DISPLAY_DAYS + 30)
             if buf_30m is not None:
                 chart_30m = build_indicator_chart(
@@ -559,7 +552,7 @@ def check_crypto_market():
                 if chart_30m:
                     send_telegram_photo(chart_30m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۳۰ دقیقه")
 
-            # ۳- نمودار ۱۵ دقیقه‌ای، ۳ روز اخیر + EMA5 + Donchian + پیوت فیبوناچی
+            # ۳- نمودار ۱۵ دقیقه‌ای، ۲ روز اخیر + EMA5 + پیوت فیبوناچی
             buf_15m = get_crypto_intraday_df(symbol, "15m", 96 * INTRADAY_DISPLAY_DAYS + 30)
             if buf_15m is not None:
                 chart_15m = build_indicator_chart(
@@ -585,6 +578,7 @@ def check_crypto_market():
 # ============================
 def get_top100_us_symbols():
     return list(STOCK_NAMES.keys())
+
 
 def check_us_stocks_market():
     """اسکن ۱۰۰ شرکت بزرگ آمریکا - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_USE_DAILY"""
@@ -614,9 +608,6 @@ def check_us_stocks_market():
             if had_zero_volume_recently(volumes):
                 continue
 
-            if should_suppress_repeat_alert(f"stock:{symbol}", diff_percent):
-                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
-
             daily_data = yf.download(symbol, period="6mo", interval="1d", progress=False)
             if daily_data.empty or len(daily_data) < 4:
                 continue
@@ -632,6 +623,10 @@ def check_us_stocks_market():
                     red_check_ok = had_three_red_candles_before_last(opens30, closes)
                 if not red_check_ok:
                     continue
+
+            # فقط وقتی همه‌ی شرایط برقرارن و قراره واقعاً هشدار ارسال بشه، کول‌داون ثبت میشه
+            if should_suppress_repeat_alert(f"stock:{symbol}", diff_percent):
+                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
 
             display_name = get_display_name(symbol, STOCK_NAMES)
             tv_link = get_tradingview_link(symbol, "stock")
@@ -658,7 +653,7 @@ def check_us_stocks_market():
             if chart_6m:
                 send_telegram_photo(chart_6m, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
 
-            # ۲- نمودار ۳۰ دقیقه‌ای، ۳ روز معاملاتی اخیر + EMA5 + Donchian + پیوت فیبوناچی
+            # ۲- نمودار ۳۰ دقیقه‌ای، ۲ روز معاملاتی اخیر + EMA5 + پیوت فیبوناچی
             try:
                 display_bars_30m = min(13 * INTRADAY_DISPLAY_DAYS, len(data30))
                 chart_30m = build_indicator_chart(
@@ -671,7 +666,7 @@ def check_us_stocks_market():
             except Exception as e:
                 log(f"خطا در ساخت نمودار ۳۰ دقیقه {symbol}: {e}")
 
-            # ۳- نمودار ۱۵ دقیقه‌ای، ۳ روز معاملاتی اخیر + EMA5 + Donchian + پیوت فیبوناچی
+            # ۳- نمودار ۱۵ دقیقه‌ای، ۲ روز معاملاتی اخیر + EMA5 + پیوت فیبوناچی
             try:
                 data15 = yf.download(symbol, period="5d", interval="15m", progress=False)
                 if not data15.empty:
@@ -696,6 +691,7 @@ def check_us_stocks_market():
             log(f"[سهام] {index}/{total} اسکن شد...")
         time.sleep(0.15)
 
+
 # ============================
 # بخش بورس تهران (TSETMC) - دو منبع مستقل برای اطمینان بیشتر
 # ============================
@@ -708,12 +704,13 @@ def check_us_stocks_market():
 # ۳ کندل قرمز همیشه روی تایم‌فریم روزانه محاسبه میشه.
 TSE_STOCK_TYPES = [300, 303, 309]  # کد نوع ابزار برای سهام عادی (بورس/فرابورس)
 
+
 def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
     """
     گرفتن اسنپ‌شات لحظه‌ای کل بازار (منبع اول: algotik-tse) و برگردوندن N نماد پرحجم‌تر.
     اگه به هر دلیل تعداد کمتر از limit شد، از لیست کامل نمادهای بورس تهران (منبع دوم:
     pytse-client) برای تکمیل تا حد limit استفاده میشه -- تا مطمئن بشیم واقعاً به تعداد
-    درخواستی نماد بررسی میشه، نه کمتر.
+    درخواستی نماد بررسی میشه، نه کمتر. اگه بازم کم بود، منبع سوم (finpy-tse) هم امتحان میشه.
     """
     import algotik_tse as att
     names = {}
@@ -743,29 +740,62 @@ def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
         except Exception as e:
             log(f"⚠️ منبع دوم (pytse-client) هم برای تکمیل لیست جواب نداد: {e}")
 
+    if len(top_symbols) < limit:
+        log(f"⚠️ هنوز فقط {len(top_symbols)} نماد؛ تلاش برای تکمیل تا {limit} از منبع سوم (finpy-tse)...")
+        try:
+            import finpy_tse as fpy
+            stock_list_df = fpy.Build_Market_StockList(
+                bourse=True, farabourse=True, payeh=False, detailed_list=False, show_progress=False
+            )
+            existing = set(top_symbols)
+            for s in stock_list_df.index.tolist():
+                if len(top_symbols) >= limit:
+                    break
+                if s not in existing:
+                    top_symbols.append(s)
+                    existing.add(s)
+        except Exception as e:
+            log(f"⚠️ منبع سوم (finpy-tse) هم برای تکمیل لیست جواب نداد: {e}")
+
     log(f"[بورس تهران] در مجموع {len(top_symbols)} از {limit} نماد هدف آماده شد.")
     return top_symbols, names
 
 
 def get_tse_daily_df_fallback(symbol, limit=180):
-    """منبع دوم (pytse-client) برای گرفتن تاریخچه‌ی روزانه‌ی یک نماد، وقتی منبع اول جواب نداد"""
+    """
+    منبع دوم (pytse-client) و در صورت شکست، منبع سوم (finpy-tse) برای گرفتن
+    تاریخچه‌ی روزانه‌ی یک نماد، وقتی منبع اول (algotik-tse) جواب نداد.
+    """
     try:
         import pytse_client as tse
         ticker = tse.Ticker(symbol)
         hist = ticker.history
-        if hist is None or len(hist) == 0:
-            return None
-        hist = hist.sort_values("date").tail(limit)
-        df = pd.DataFrame({
-            "Open": hist["open"].astype(float).values,
-            "High": hist["high"].astype(float).values,
-            "Low": hist["low"].astype(float).values,
-            "Close": hist["close"].astype(float).values,
-        }, index=pd.to_datetime(hist["date"].values))
-        return df
+        if hist is not None and len(hist) > 0:
+            hist = hist.sort_values("date").tail(limit)
+            return pd.DataFrame({
+                "Open": hist["open"].astype(float).values,
+                "High": hist["high"].astype(float).values,
+                "Low": hist["low"].astype(float).values,
+                "Close": hist["close"].astype(float).values,
+            }, index=pd.to_datetime(hist["date"].values))
     except Exception as e:
         log(f"خطا در منبع دوم (pytse-client) برای {symbol}: {e}")
-        return None
+
+    try:
+        import finpy_tse as fpy
+        hist = fpy.Get_Price_History(stock=symbol, ignore_date=True, adjust_price=True, show_weekday=False)
+        if hist is not None and len(hist) > 0:
+            hist = hist.tail(limit)
+            return pd.DataFrame({
+                "Open": hist["Open"].astype(float).values,
+                "High": hist["High"].astype(float).values,
+                "Low": hist["Low"].astype(float).values,
+                "Close": hist["Close"].astype(float).values,
+            }, index=pd.to_datetime(hist.index))
+    except Exception as e:
+        log(f"خطا در منبع سوم (finpy-tse) برای {symbol}: {e}")
+
+    return None
 
 
 def check_tehran_stocks_market():
@@ -820,12 +850,13 @@ def check_tehran_stocks_market():
             if diff_percent > DIFF_THRESHOLD:
                 continue
 
-            if should_suppress_repeat_alert(f"tse:{symbol}", diff_percent):
-                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
-
             if REQUIRE_RED_CANDLES:
                 if not had_three_red_candles_before_last(opens, closes):
                     continue
+
+            # فقط وقتی همه‌ی شرایط برقرارن و قراره واقعاً هشدار ارسال بشه، کول‌داون ثبت میشه
+            if should_suppress_repeat_alert(f"tse:{symbol}", diff_percent):
+                continue  # کول‌داون فعاله یا تغییر معناداری نبوده -> رد میشه
 
             # نمودار ۶ ماهه‌ی جداگانه فقط برای نمادی که واجد شرایط شده -- اول منبع اول، بعد منبع دوم
             daily_df = None
