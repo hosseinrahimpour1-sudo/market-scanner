@@ -16,7 +16,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدورر هشدار
+DIFF_THRESHOLD = -1          # درصد افت از EMA برای صدورر هشدار
 REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
 RED_CANDLE_USE_DAILY = False # True = شرط روی کندل روزانه | False = شرط روی کندل ۳۰ دقیقه (پیش‌فرض) -- فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily
 INTRADAY_DISPLAY_DAYS = 2    # تعداد روزهایی که توی نمودارهای ۳۰ و ۱۵ دقیقه‌ای نمایش داده میشه
