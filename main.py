@@ -16,7 +16,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -0.5        # درصد افت از EMA برای صدور هشدار
+DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدور هشدار
 REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
 RED_CANDLE_USE_DAILY = False # True = شرط روی کندل روزانه | False = شرط روی کندل ۳۰ دقیقه (پیش‌فرض) -- فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily
 INTRADAY_DISPLAY_DAYS = 2    # تعداد روزهایی که توی نمودارهای ۳۰ و ۱۵ دقیقه‌ای نمایش داده میشه
@@ -27,6 +27,8 @@ TSE_RANK_LIMIT = 200         # فقط ۲۰۰ نماد برتر بورس تهرا
 FROZEN_TOLERANCE = 1.0       # تغییر کمتر از این (واحد: درصد) یعنی هنوز همون سیگنال قبلیه، نه یه افت جدید
 ALERT_COOLDOWN_SECONDS = 6 * 3600  # بعد از هر هشدار، حداقل ۶ ساعت برای همون نماد دوباره هشدار نده
 IRAN_BROKER_CHECK_TIMEOUT = 8
+
+
 
 # ============================
 # دیکشنری نام فارسی/انگلیسی نمادهای پرکاربرد
@@ -122,8 +124,10 @@ IRAN_CRYPTO_BROKERS = ["نوبیتکس", "والکس"]
 # ردیابی «آخرین هشدار» هر نماد (فاصله قیمت-EMA + زمان)، برای جلوگیری از اسپم روی نماد تکراری/مرده
 LAST_ALERT_STATE = {}
 
+
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
 
 def get_display_name(symbol, names_dict):
     """برگردوندن رشته‌ی 'نماد (اسم انگلیسی | اسم فارسی)' یا فقط خود نماد اگه پیدا نشد"""
@@ -133,11 +137,13 @@ def get_display_name(symbol, names_dict):
         return f"{symbol} ({en} | {fa})"
     return symbol
 
+
 def get_tradingview_link(symbol, market):
     """لینک واقعی و تست‌شده‌ی صفحه‌ی نماد در تردینگ‌ویو"""
     if market == "crypto":
         return f"https://www.tradingview.com/symbols/{quote(symbol)}/?exchange=BINANCE"
     return f"https://www.tradingview.com/symbols/{quote(symbol)}/"
+
 
 def get_binance_link(symbol):
     """لینک مستقیم صفحه‌ی معامله‌ی نماد در خود بایننس"""
@@ -145,6 +151,7 @@ def get_binance_link(symbol):
         base = symbol[:-4]
         return f"https://www.binance.com/en/trade/{quote(base)}_USDT"
     return f"https://www.binance.com/en/trade/{quote(symbol)}"
+
 
 def should_suppress_repeat_alert(state_key, diff_percent):
     """
@@ -167,6 +174,7 @@ def should_suppress_repeat_alert(state_key, diff_percent):
 
     LAST_ALERT_STATE[state_key] = {"diff": diff_percent, "time": now}
     return False
+
 
 def get_iran_broker_links(base_currency):
     """
@@ -213,21 +221,28 @@ def get_iran_broker_links(base_currency):
 
     return listed_in
 
-def send_telegram_message(text):
-    """ارسال پیام متنی به تلگرام"""
+
+def send_telegram_message(text, _retry=True):
+    """ارسال پیام متنی به تلگرام؛ اگه تلگرام به‌خاطر ارسال زیاد Rate Limit بده (429)، یه بار صبر و تلاش مجدد می‌کنه"""
     if not TOKEN or not CHAT_ID:
         log("⚠️ توکن یا چت‌آیدی تنظیم نشده! پیام ارسال نشد.")
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
         r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
+        if r.status_code == 429 and _retry:
+            retry_after = r.json().get("parameters", {}).get("retry_after", 3)
+            log(f"⏳ تلگرام Rate Limit داد (sendMessage)؛ {retry_after} ثانیه صبر و یه بار تلاش مجدد...")
+            time.sleep(retry_after + 1)
+            send_telegram_message(text, _retry=False)
+        elif r.status_code != 200:
             log(f"خطای تلگرام (sendMessage): {r.status_code} - {r.text[:200]}")
     except Exception as e:
         log(f"خطا در ارسال پیام تلگرام: {e}")
 
-def send_telegram_photo(image_bytes, caption):
-    """ارسال عکس (نمودار شمعی) همراه با کپشن به تلگرام"""
+
+def send_telegram_photo(image_bytes, caption, _retry=True):
+    """ارسال عکس (نمودار شمعی) همراه با کپشن به تلگرام؛ همین‌طور با مدیریت Rate Limit (429)"""
     if not TOKEN or not CHAT_ID:
         log("⚠️ توکن یا چت‌آیدی تنظیم نشده! عکس ارسال نشد.")
         return
@@ -236,12 +251,19 @@ def send_telegram_photo(image_bytes, caption):
         files = {"photo": ("chart.png", image_bytes, "image/png")}
         data = {"chat_id": CHAT_ID, "caption": caption}
         r = requests.post(url, data=data, files=files, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
+        if r.status_code == 429 and _retry:
+            retry_after = r.json().get("parameters", {}).get("retry_after", 3)
+            log(f"⏳ تلگرام Rate Limit داد (sendPhoto)؛ {retry_after} ثانیه صبر و یه بار تلاش مجدد...")
+            time.sleep(retry_after + 1)
+            image_bytes.seek(0)
+            send_telegram_photo(image_bytes, caption, _retry=False)
+        elif r.status_code != 200:
             log(f"خطای تلگرام (sendPhoto): {r.status_code} - {r.text[:200]}")
             send_telegram_message(caption)
     except Exception as e:
         log(f"خطا در ارسال عکس: {e}")
         send_telegram_message(caption)
+
 
 def calculate_ema(prices, period):
     """محاسبه ریاضی اندیکاتور EMA"""
@@ -252,6 +274,7 @@ def calculate_ema(prices, period):
     for price in prices[period:]:
         ema = (price - ema) * multiplier + ema
     return ema
+
 
 def had_three_red_candles_before_last(opens, closes):
     """
@@ -265,6 +288,7 @@ def had_three_red_candles_before_last(opens, closes):
             return False
     return True
 
+
 def had_zero_volume_recently(volumes):
     """بررسی اینکه آیا در ۳ کندل قبل از کندل فعلی حجم صفر بوده"""
     if len(volumes) < 4:
@@ -272,9 +296,11 @@ def had_zero_volume_recently(volumes):
     vols_before = volumes[-4:-1]
     return any(v == 0 for v in vols_before)
 
+
 def calculate_ema_series(close_series, period=EMA_PERIOD):
     """محاسبه‌ی سری کامل EMA (برای رسم روی نمودار، نه فقط عدد نهایی)"""
     return close_series.ewm(span=period, adjust=False).mean()
+
 
 def calculate_fibonacci_pivots(prev_high, prev_low, prev_close):
     """محاسبه‌ی سطوح پیوت استاندارد در حالت فیبوناچی، بر اساس High/Low/Close روز قبل"""
@@ -285,6 +311,7 @@ def calculate_fibonacci_pivots(prev_high, prev_low, prev_close):
         "R1": pp + 0.382 * diff, "R2": pp + 0.618 * diff, "R3": pp + 1.000 * diff,
         "S1": pp - 0.382 * diff, "S2": pp - 0.618 * diff, "S3": pp - 1.000 * diff,
     }
+
 
 def compute_pivot_series(intraday_index, daily_df):
     """
@@ -310,12 +337,14 @@ def compute_pivot_series(intraday_index, daily_df):
             levels[k].append(p[k] if p else float("nan"))
     return {k: pd.Series(v, index=intraday_index) for k, v in levels.items()}
 
+
 # رنگ‌های واضح‌تر برای پیوت (PP قبلاً نارنجی/زرد کم‌رنگ بود و دیده نمی‌شد؛ الان بنفش پررنگ)
 PIVOT_COLORS = {
     "PP": "#800080",
     "R1": "#ff6666", "R2": "#ff0000", "R3": "#990000",
     "S1": "#66cc66", "S2": "#00aa00", "S3": "#006600",
 }
+
 
 def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivots=False):
     """
@@ -357,6 +386,7 @@ def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivo
         log(f"خطا در ساخت نمودار اندیکاتور ({title}): {e}")
         return None
 
+
 def make_candlestick_chart(df, title=""):
     """ساخت تصویر کوچیک نمودار شمعی ساده (بدون اندیکاتور) از دیتافریم OHLC"""
     buf = io.BytesIO()
@@ -375,6 +405,7 @@ def make_candlestick_chart(df, title=""):
     except Exception as e:
         log(f"خطا در ساخت نمودار: {e}")
         return None
+
 
 # ============================
 # بخش کریپتو (بایننس)
@@ -418,6 +449,7 @@ def get_crypto_daily_df(symbol, limit=180):
         log(f"خطا در دریافت دیتای روزانه {symbol}: {e}")
         return None
 
+
 def get_crypto_intraday_df(symbol, interval, limit):
     """گرفتن دیتافریم OHLC درون‌روزی (۳۰ دقیقه یا ۱۵ دقیقه) برای نمودارهای اضافی"""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
@@ -437,6 +469,7 @@ def get_crypto_intraday_df(symbol, interval, limit):
     except Exception as e:
         log(f"خطا در دریافت دیتای {interval} برای {symbol}: {e}")
         return None
+
 
 def check_crypto_market():
     """اسکن بازار کریپتو (بایننس) - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_USE_DAILY"""
@@ -518,6 +551,7 @@ def check_crypto_market():
             chart_6m = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
             if chart_6m:
                 send_telegram_photo(chart_6m, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
+                time.sleep(0.4)
 
             # ۲- نمودار ۳۰ دقیقه‌ای، ۲ روز اخیر + EMA5 + پیوت فیبوناچی
             buf_30m = get_crypto_intraday_df(symbol, "30m", 48 * INTRADAY_DISPLAY_DAYS + 30)
@@ -529,6 +563,7 @@ def check_crypto_market():
                 )
                 if chart_30m:
                     send_telegram_photo(chart_30m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۳۰ دقیقه")
+                    time.sleep(0.4)
 
             # ۳- نمودار ۱۵ دقیقه‌ای، ۲ روز اخیر + EMA5 + پیوت فیبوناچی
             buf_15m = get_crypto_intraday_df(symbol, "15m", 96 * INTRADAY_DISPLAY_DAYS + 30)
@@ -540,6 +575,7 @@ def check_crypto_market():
                 )
                 if chart_15m:
                     send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۱۵ دقیقه")
+                    time.sleep(0.4)
 
             # ۴- در آخر، توضیحات کامل به‌صورت پیام متنی جدا
             send_telegram_message(caption)
@@ -550,11 +586,13 @@ def check_crypto_market():
             log(f"[کریپتو] {index}/{total} اسکن شد...")
         time.sleep(0.15)
 
+
 # ============================
 # بخش سهام آمریکا (Yahoo Finance)
 # ============================
 def get_top100_us_symbols():
     return list(STOCK_NAMES.keys())
+
 
 def check_us_stocks_market():
     """اسکن ۱۰۰ شرکت بزرگ آمریکا - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_USE_DAILY"""
@@ -628,6 +666,7 @@ def check_us_stocks_market():
             chart_6m = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
             if chart_6m:
                 send_telegram_photo(chart_6m, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
+                time.sleep(0.4)
 
             # ۲- نمودار ۳۰ دقیقه‌ای، ۲ روز معاملاتی اخیر + EMA5 + پیوت فیبوناچی
             try:
@@ -639,6 +678,7 @@ def check_us_stocks_market():
                 )
                 if chart_30m:
                     send_telegram_photo(chart_30m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز معاملاتی اخیر، تایم‌فریم ۳۰ دقیقه")
+                    time.sleep(0.4)
             except Exception as e:
                 log(f"خطا در ساخت نمودار ۳۰ دقیقه {symbol}: {e}")
 
@@ -655,6 +695,7 @@ def check_us_stocks_market():
                     )
                     if chart_15m:
                         send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز معاملاتی اخیر، تایم‌فریم ۱۵ دقیقه")
+                        time.sleep(0.4)
             except Exception as e:
                 log(f"خطا در ساخت نمودار ۱۵ دقیقه {symbol}: {e}")
 
@@ -672,6 +713,9 @@ def check_us_stocks_market():
 # ============================
 # منبع اول: algotik-tse (رتبه‌بندی زنده‌ی کل بازار + تاریخچه‌ی دسته‌جمعی)
 # منبع دوم: pytse-client (فقط برای پر کردن جا/جبران وقتی منبع اول برای یک نماد جواب نداد)
+# (نکته: یه منبع سوم -- finpy-tse -- امتحان شد ولی چون وابستگیش (lxml) روی Railway
+#  build نمی‌شد و کل Deploy رو fail می‌کرد، حذف شد. سلامت کل ربات روی این یه بخش
+#  اولویت داره؛ اگه بعداً منبع سوم پایدارتری پیدا شد، اضافه میشه.)
 # چون بورس تهران API رسمی و رایگان نداره، هر دو کتابخانه از tsetmc.com می‌خونن و ممکنه
 # به‌مرور با تغییرات اون سایت از کار بیفتن. اگه هردو خطا بدن، فقط همین بخش غیرفعال میشه
 # و بقیه‌ی ربات (کریپتو و سهام آمریکا) عادی کار می‌کنه.
@@ -679,12 +723,13 @@ def check_us_stocks_market():
 # ۳ کندل قرمز همیشه روی تایم‌فریم روزانه محاسبه میشه.
 TSE_STOCK_TYPES = [300, 303, 309]  # کد نوع ابزار برای سهام عادی (بورس/فرابورس)
 
+
 def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
     """
     گرفتن اسنپ‌شات لحظه‌ای کل بازار (منبع اول: algotik-tse) و برگردوندن N نماد پرحجم‌تر.
     اگه به هر دلیل تعداد کمتر از limit شد، از لیست کامل نمادهای بورس تهران (منبع دوم:
     pytse-client) برای تکمیل تا حد limit استفاده میشه -- تا مطمئن بشیم واقعاً به تعداد
-    درخواستی نماد بررسی میشه، نه کمتر. اگه بازم کم بود، منبع سوم (finpy-tse) هم امتحان میشه.
+    درخواستی نماد بررسی میشه، نه کمتر.
     """
     import algotik_tse as att
     names = {}
@@ -714,31 +759,12 @@ def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
         except Exception as e:
             log(f"⚠️ منبع دوم (pytse-client) هم برای تکمیل لیست جواب نداد: {e}")
 
-    if len(top_symbols) < limit:
-        log(f"⚠️ هنوز فقط {len(top_symbols)} نماد؛ تلاش برای تکمیل تا {limit} از منبع سوم (finpy-tse)...")
-        try:
-            import finpy_tse as fpy
-            stock_list_df = fpy.Build_Market_StockList(
-                bourse=True, farabourse=True, payeh=False, detailed_list=False, show_progress=False
-            )
-            existing = set(top_symbols)
-            for s in stock_list_df.index.tolist():
-                if len(top_symbols) >= limit:
-                    break
-                if s not in existing:
-                    top_symbols.append(s)
-                    existing.add(s)
-        except Exception as e:
-            log(f"⚠️ منبع سوم (finpy-tse) هم برای تکمیل لیست جواب نداد: {e}")
-
     log(f"[بورس تهران] در مجموع {len(top_symbols)} از {limit} نماد هدف آماده شد.")
     return top_symbols, names
 
+
 def get_tse_daily_df_fallback(symbol, limit=180):
-    """
-    منبع دوم (pytse-client) و در صورت شکست، منبع سوم (finpy-tse) برای گرفتن
-    تاریخچه‌ی روزانه‌ی یک نماد، وقتی منبع اول (algotik-tse) جواب نداد.
-    """
+    """منبع دوم (pytse-client) برای گرفتن تاریخچه‌ی روزانه‌ی یک نماد، وقتی منبع اول (algotik-tse) جواب نداد."""
     try:
         import pytse_client as tse
         ticker = tse.Ticker(symbol)
@@ -754,21 +780,8 @@ def get_tse_daily_df_fallback(symbol, limit=180):
     except Exception as e:
         log(f"خطا در منبع دوم (pytse-client) برای {symbol}: {e}")
 
-    try:
-        import finpy_tse as fpy
-        hist = fpy.Get_Price_History(stock=symbol, ignore_date=True, adjust_price=True, show_weekday=False)
-        if hist is not None and len(hist) > 0:
-            hist = hist.tail(limit)
-            return pd.DataFrame({
-                "Open": hist["Open"].astype(float).values,
-                "High": hist["High"].astype(float).values,
-                "Low": hist["Low"].astype(float).values,
-                "Close": hist["Close"].astype(float).values,
-            }, index=pd.to_datetime(hist.index))
-    except Exception as e:
-        log(f"خطا در منبع سوم (finpy-tse) برای {symbol}: {e}")
-
     return None
+
 
 def check_tehran_stocks_market():
     try:
@@ -856,6 +869,7 @@ def check_tehran_stocks_market():
             chart = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
             if chart:
                 send_telegram_photo(chart, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
+                time.sleep(0.4)
 
             send_telegram_message(caption)
         except Exception as e:
@@ -863,6 +877,7 @@ def check_tehran_stocks_market():
 
         if index % 40 == 0:
             log(f"[بورس تهران] {index}/{total} اسکن شد...")
+
 
 # ============================
 # حلقه اصلی برنامه
