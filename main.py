@@ -16,17 +16,19 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -0.2          # درصد افت از EMA برای صدور هشدار
-REQUIRE_RED_CANDLES = False  # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
-RED_CANDLE_TIMEFRAME = "daily"  # تایم‌فریم شرط ۳ کندل قرمز: "daily" یا "30m" (فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily)
+DIFF_THRESHOLD = -5          # درصد افت از EMA برای صدور هشدار
+REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
+RED_CANDLE_USE_DAILY = True  # True = شرط روی کندل روزانه | False = شرط روی کندل ۳۰ دقیقه (فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily)
 DONCHIAN_PERIOD = 20         # دوره‌ی استاندارد اندیکاتور Donchian Channel
-CYCLE_SECONDS = 180          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
+INTRADAY_DISPLAY_DAYS = 3    # تعداد روزهایی که توی نمودارهای ۳۰ و ۱۵ دقیقه‌ای نمایش داده میشه
+CYCLE_SECONDS = 300          # فاصله بین هر چرخه‌ی کامل اسکن (۵ دقیقه)
 REQUEST_TIMEOUT = 15
 CRYPTO_RANK_LIMIT = 300      # فقط ۳۰۰ ارز برتر بر اساس حجم معاملات ۲۴ ساعته (رنک نقدشوندگی)
 TSE_RANK_LIMIT = 200         # فقط ۲۰۰ نماد برتر بورس تهران بر اساس حجم معاملات امروز
 FROZEN_TOLERANCE = 1.0       # تغییر کمتر از این (واحد: درصد) یعنی هنوز همون سیگنال قبلیه، نه یه افت جدید
 ALERT_COOLDOWN_SECONDS = 6 * 3600  # بعد از هر هشدار، حداقل ۶ ساعت برای همون نماد دوباره هشدار نده
 IRAN_BROKER_CHECK_TIMEOUT = 8
+
 
 
 # ============================
@@ -175,14 +177,16 @@ def should_suppress_repeat_alert(state_key, diff_percent):
     return False
 
 
-def get_iran_broker_listing(base_currency):
+def get_iran_broker_links(base_currency):
     """
-    بررسی اینکه آیا این ارز در صرافی‌های معروف ایرانی (نوبیتکس، والکس) لیست شده.
+    بررسی اینکه آیا این ارز در صرافی‌های معروف ایرانی (نوبیتکس، والکس) لیست شده،
+    و اگه بله، لینک مستقیم صفحه‌ش رو هم برمی‌گردونه. خروجی: لیستی از (نام, لینک).
     این بخش فقط برای نمادهایی که قراره هشدار براشون ارسال بشه صدا زده میشه (حجم کم درخواست).
     اگه هر صرافی در دسترس نبود، فقط از لیست نتیجه رد میشه (خطای کلی رو نمی‌شکنه).
     """
     listed_in = []
     base_lower = base_currency.lower()
+    base_upper = base_currency.upper()
 
     # نوبیتکس
     try:
@@ -196,7 +200,7 @@ def get_iran_broker_listing(base_currency):
             stats = data.get("stats", {})
             key = f"{base_lower}-usdt"
             if key in stats and stats[key] and not stats[key].get("isClosed", True):
-                listed_in.append("نوبیتکس")
+                listed_in.append(("نوبیتکس", f"https://nobitex.ir/price/{base_lower}/"))
     except Exception:
         pass
 
@@ -207,10 +211,12 @@ def get_iran_broker_listing(base_currency):
         result = data.get("result", data)
         symbols_dict = result.get("symbols", result) if isinstance(result, dict) else {}
         if isinstance(symbols_dict, dict):
-            target = f"{base_currency.upper()}USDT"
-            target_tmn = f"{base_currency.upper()}TMN"
-            if target in symbols_dict or target_tmn in symbols_dict:
-                listed_in.append("والکس")
+            target = f"{base_upper}USDT"
+            target_tmn = f"{base_upper}TMN"
+            if target in symbols_dict:
+                listed_in.append(("والکس", f"https://wallex.ir/app/trade/{target}"))
+            elif target_tmn in symbols_dict:
+                listed_in.append(("والکس", f"https://wallex.ir/app/trade/{target_tmn}"))
     except Exception:
         pass
 
@@ -281,6 +287,106 @@ def had_zero_volume_recently(volumes):
     return any(v == 0 for v in vols_before)
 
 
+def calculate_ema_series(close_series, period=EMA_PERIOD):
+    """محاسبه‌ی سری کامل EMA (برای رسم روی نمودار، نه فقط عدد نهایی)"""
+    return close_series.ewm(span=period, adjust=False).mean()
+
+
+def calculate_donchian(df, period=DONCHIAN_PERIOD):
+    """محاسبه‌ی باندهای بالا/پایین اندیکاتور استاندارد Donchian Channel"""
+    upper = df["High"].rolling(window=period, min_periods=1).max()
+    lower = df["Low"].rolling(window=period, min_periods=1).min()
+    return upper, lower
+
+
+def calculate_fibonacci_pivots(prev_high, prev_low, prev_close):
+    """محاسبه‌ی سطوح پیوت استاندارد در حالت فیبوناچی، بر اساس High/Low/Close روز قبل"""
+    pp = (prev_high + prev_low + prev_close) / 3
+    diff = prev_high - prev_low
+    return {
+        "PP": pp,
+        "R1": pp + 0.382 * diff, "R2": pp + 0.618 * diff, "R3": pp + 1.000 * diff,
+        "S1": pp - 0.382 * diff, "S2": pp - 0.618 * diff, "S3": pp - 1.000 * diff,
+    }
+
+
+def compute_pivot_series(intraday_index, daily_df):
+    """
+    برای هر روز موجود در ایندکس نمودار درون‌روزی، سطوح پیوت فیبوناچی رو بر اساس
+    High/Low/Close روز *قبل* (از دیتافریم روزانه) حساب می‌کنه و به‌شکل ۷ سری هم‌طول
+    با intraday_index برمی‌گردونه (برای رسم روی نمودار به‌صورت خط‌های افقی پله‌ای).
+    """
+    daily_df = daily_df.sort_index()
+    daily_dates = daily_df.index.normalize()
+    unique_dates = intraday_index.normalize().unique()
+
+    pivot_by_date = {}
+    for d in unique_dates:
+        prev_days = daily_df[daily_dates < d]
+        pivot_by_date[d] = calculate_fibonacci_pivots(
+            prev_days["High"].iloc[-1], prev_days["Low"].iloc[-1], prev_days["Close"].iloc[-1]
+        ) if len(prev_days) > 0 else None
+
+    levels = {k: [] for k in ("PP", "R1", "R2", "R3", "S1", "S2", "S3")}
+    for ts in intraday_index:
+        p = pivot_by_date.get(ts.normalize())
+        for k in levels:
+            levels[k].append(p[k] if p else float("nan"))
+    return {k: pd.Series(v, index=intraday_index) for k, v in levels.items()}
+
+
+PIVOT_COLORS = {
+    "PP": "orange",
+    "R1": "#ff9999", "R2": "#ff6666", "R3": "#ff3333",
+    "S1": "#99dd99", "S2": "#66cc66", "S3": "#33aa33",
+}
+
+
+
+def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivots=False):
+    """
+    نمودار شمعی با EMA5 + Donchian Channel(20) + (اختیاری) پیوت فیبوناچی روزانه.
+    اندیکاتورها روی کل df_full حساب میشن (برای دقت لبه‌ها) و در آخر فقط display_bars
+    کندل آخر نمایش داده میشه.
+    """
+    buf = io.BytesIO()
+    try:
+        ema_series = calculate_ema_series(df_full["Close"], EMA_PERIOD)
+        upper, lower = calculate_donchian(df_full, DONCHIAN_PERIOD)
+
+        df_display = df_full.tail(display_bars)
+        addplots = [
+            mpf.make_addplot(ema_series.tail(display_bars), color="blue", width=1.0),
+            mpf.make_addplot(upper.tail(display_bars), color="green", width=0.8),
+            mpf.make_addplot(lower.tail(display_bars), color="red", width=0.8),
+        ]
+
+        if show_pivots and daily_df is not None and len(daily_df) > 0:
+            pivots = compute_pivot_series(df_full.index, daily_df)
+            for level, series in pivots.items():
+                addplots.append(
+                    mpf.make_addplot(
+                        series.tail(display_bars), color=PIVOT_COLORS[level], width=0.6, linestyle="--"
+                    )
+                )
+
+        mpf.plot(
+            df_display,
+            type="candle",
+            style="charles",
+            volume=False,
+            title=title,
+            figsize=(5, 3.2),
+            addplot=addplots,
+            savefig=dict(fname=buf, dpi=90, bbox_inches="tight"),
+        )
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        log(f"خطا در ساخت نمودار اندیکاتور ({title}): {e}")
+        return None
+
+
 def make_candlestick_chart(df, title=""):
     """ساخت تصویر کوچیک نمودار شمعی ساده (بدون اندیکاتور) از دیتافریم OHLC"""
     buf = io.BytesIO()
@@ -298,51 +404,6 @@ def make_candlestick_chart(df, title=""):
         return buf
     except Exception as e:
         log(f"خطا در ساخت نمودار: {e}")
-        return None
-
-
-def calculate_ema_series(close_series, period=EMA_PERIOD):
-    """محاسبه‌ی سری کامل EMA (برای رسم روی نمودار، نه فقط عدد نهایی)"""
-    return close_series.ewm(span=period, adjust=False).mean()
-
-
-def calculate_donchian(df, period=DONCHIAN_PERIOD):
-    """محاسبه‌ی باندهای بالا/پایین اندیکاتور استاندارد Donchian Channel"""
-    upper = df["High"].rolling(window=period, min_periods=1).max()
-    lower = df["Low"].rolling(window=period, min_periods=1).min()
-    return upper, lower
-
-
-def make_indicator_chart(df, title="", show_ema=True, show_donchian=False):
-    """
-    نسخه‌ی پیشرفته‌ی نمودار شمعی که می‌تونه خط EMA5 و/یا باندهای Donchian Channel
-    رو هم روی خود نمودار رسم کنه. برای نمودارهای درون‌روزی (۳۰ و ۱۵ دقیقه) استفاده میشه.
-    """
-    buf = io.BytesIO()
-    try:
-        addplots = []
-        if show_ema and len(df) >= 2:
-            ema_series = calculate_ema_series(df["Close"], EMA_PERIOD)
-            addplots.append(mpf.make_addplot(ema_series, color="blue", width=1.0))
-        if show_donchian and len(df) >= 2:
-            upper, lower = calculate_donchian(df, DONCHIAN_PERIOD)
-            addplots.append(mpf.make_addplot(upper, color="green", width=0.8))
-            addplots.append(mpf.make_addplot(lower, color="red", width=0.8))
-
-        mpf.plot(
-            df,
-            type="candle",
-            style="charles",
-            volume=False,
-            title=title,
-            figsize=(5, 3.2),
-            addplot=addplots if addplots else None,
-            savefig=dict(fname=buf, dpi=90, bbox_inches="tight"),
-        )
-        buf.seek(0)
-        return buf
-    except Exception as e:
-        log(f"خطا در ساخت نمودار اندیکاتور: {e}")
         return None
 
 
@@ -411,7 +472,7 @@ def get_crypto_intraday_df(symbol, interval, limit):
 
 
 def check_crypto_market():
-    """اسکن بازار کریپتو (بایننس) - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_TIMEFRAME"""
+    """اسکن بازار کریپتو (بایننس) - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_USE_DAILY"""
     symbols = get_top_ranked_usdt_symbols()
     total = len(symbols)
     log(f"[کریپتو] {total} ارز برتر (بر اساس حجم ۲۴ ساعته) پیدا شد.")
@@ -447,12 +508,12 @@ def check_crypto_market():
                 continue
 
             if REQUIRE_RED_CANDLES:
-                if RED_CANDLE_TIMEFRAME == "30m":
-                    red_check_ok = had_three_red_candles_before_last(opens30, closes)
-                else:
+                if RED_CANDLE_USE_DAILY:
                     red_check_ok = had_three_red_candles_before_last(
                         daily_df["Open"].tolist(), daily_df["Close"].tolist()
                     )
+                else:
+                    red_check_ok = had_three_red_candles_before_last(opens30, closes)
                 if not red_check_ok:
                     continue
 
@@ -460,54 +521,57 @@ def check_crypto_market():
             tv_link = get_tradingview_link(symbol, "crypto")
             binance_link = get_binance_link(symbol)
             base_currency = symbol[:-4] if symbol.endswith("USDT") else symbol
-            brokers = get_iran_broker_listing(base_currency)
-            broker_line = f"لیست‌شده در بروکر ایرانی: {', '.join(brokers)}\n" if brokers else ""
+            broker_links = get_iran_broker_links(base_currency)
+            broker_lines = "".join(f"🟢 {name}: {link}\n" for name, link in broker_links)
 
             last_volume = volumes[-1]
             last_value = quote_values[-1]
+            red_tf_label = "روزانه" if RED_CANDLE_USE_DAILY else "30m"
 
             caption = (
                 f"🪙 ⚠️ [کریپتو] هشدار ریزش از EMA!\n"
                 f"نماد: {display_name}\n"
-                f"تایم‌فریم EMA: 30m | تایم‌فریم کندل قرمز: {RED_CANDLE_TIMEFRAME}\n"
+                f"تایم‌فریم EMA: 30m | تایم‌فریم کندل قرمز: {red_tf_label}\n"
                 f"قیمت: {current_price}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
-                f"حجم کندل آخر (30m): {last_volume:,.2f} {base_currency}\n"
-                f"ارزش کندل آخر (30m): {last_value:,.2f} USDT\n"
-                f"{broker_line}"
+                f"حجم کندل آخر (30m): {last_volume:,.0f} {base_currency}\n"
+                f"ارزش کندل آخر (30m): {last_value:,.0f} USDT\n"
                 f"نمودار تردینگ‌ویو: {tv_link}\n"
-                f"نمودار بایننس: {binance_link}"
+                f"نمودار بایننس: {binance_link}\n"
+                f"{broker_lines}"
             )
             log(caption)
 
+            # ۱- نمودار ۶ ماهه (روزانه)
             chart_6m = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
             if chart_6m:
-                send_telegram_photo(chart_6m, caption)
-            else:
-                send_telegram_message(caption)
+                send_telegram_photo(chart_6m, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
 
-            intraday_30m_df = get_crypto_intraday_df(symbol, "30m", 50)
-            if intraday_30m_df is not None:
-                chart_30m = make_indicator_chart(
-                    intraday_30m_df, title=f"{symbol} - 1D 30m + EMA{EMA_PERIOD}", show_ema=True
+            # ۲- نمودار ۳۰ دقیقه‌ای، ۳ روز اخیر + EMA5 + Donchian + پیوت فیبوناچی
+            buf_30m = get_crypto_intraday_df(symbol, "30m", 48 * INTRADAY_DISPLAY_DAYS + 30)
+            if buf_30m is not None:
+                chart_30m = build_indicator_chart(
+                    buf_30m, 48 * INTRADAY_DISPLAY_DAYS,
+                    title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 30m",
+                    daily_df=daily_df, show_pivots=True,
                 )
                 if chart_30m:
-                    send_telegram_photo(chart_30m, f"⏱ {symbol} - نمودار ۱ روزه، تایم‌فریم ۳۰ دقیقه + EMA{EMA_PERIOD}")
+                    send_telegram_photo(chart_30m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۳۰ دقیقه")
 
-            intraday_15m_df = get_crypto_intraday_df(symbol, "15m", 120)
-            if intraday_15m_df is not None:
-                chart_15m = make_indicator_chart(
-                    intraday_15m_df,
-                    title=f"{symbol} - 1D 15m + EMA{EMA_PERIOD} + DC{DONCHIAN_PERIOD}",
-                    show_ema=True,
-                    show_donchian=True,
+            # ۳- نمودار ۱۵ دقیقه‌ای، ۳ روز اخیر + EMA5 + Donchian + پیوت فیبوناچی
+            buf_15m = get_crypto_intraday_df(symbol, "15m", 96 * INTRADAY_DISPLAY_DAYS + 30)
+            if buf_15m is not None:
+                chart_15m = build_indicator_chart(
+                    buf_15m, 96 * INTRADAY_DISPLAY_DAYS,
+                    title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 15m",
+                    daily_df=daily_df, show_pivots=True,
                 )
                 if chart_15m:
-                    send_telegram_photo(
-                        chart_15m,
-                        f"⏱ {symbol} - نمودار ۱ روزه، تایم‌فریم ۱۵ دقیقه + EMA{EMA_PERIOD} + Donchian Channel({DONCHIAN_PERIOD})",
-                    )
+                    send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۱۵ دقیقه")
+
+            # ۴- در آخر، توضیحات کامل به‌صورت پیام متنی جدا
+            send_telegram_message(caption)
         except Exception as e:
             log(f"خطا در پردازش {symbol}: {e}")
 
@@ -522,9 +586,8 @@ def check_crypto_market():
 def get_top100_us_symbols():
     return list(STOCK_NAMES.keys())
 
-
 def check_us_stocks_market():
-    """اسکن ۱۰۰ شرکت بزرگ آمریکا - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_TIMEFRAME"""
+    """اسکن ۱۰۰ شرکت بزرگ آمریکا - کندل ۳۰ دقیقه‌ای برای EMA، شرط ۳ کندل قرمز طبق RED_CANDLE_USE_DAILY"""
     symbols = get_top100_us_symbols()
     total = len(symbols)
     log(f"[سهام] {total} نماد پیدا شد.")
@@ -534,6 +597,7 @@ def check_us_stocks_market():
             data30 = yf.download(symbol, period="5d", interval="30m", progress=False)
             if data30.empty or len(data30) < EMA_PERIOD or len(data30) < 4:
                 continue
+            data30 = data30[["Open", "High", "Low", "Close", "Volume"]].copy()
 
             opens30 = data30["Open"].values.flatten().tolist()
             closes = data30["Close"].values.flatten().tolist()
@@ -559,13 +623,13 @@ def check_us_stocks_market():
             daily_df = daily_data[["Open", "High", "Low", "Close"]].copy()
 
             if REQUIRE_RED_CANDLES:
-                if RED_CANDLE_TIMEFRAME == "30m":
-                    red_check_ok = had_three_red_candles_before_last(opens30, closes)
-                else:
+                if RED_CANDLE_USE_DAILY:
                     red_check_ok = had_three_red_candles_before_last(
                         daily_df["Open"].values.flatten().tolist(),
                         daily_df["Close"].values.flatten().tolist(),
                     )
+                else:
+                    red_check_ok = had_three_red_candles_before_last(opens30, closes)
                 if not red_check_ok:
                     continue
 
@@ -574,57 +638,57 @@ def check_us_stocks_market():
 
             last_volume = volumes[-1]
             last_value = last_volume * current_price  # ارزش تقریبی (حجم × قیمت)
+            red_tf_label = "روزانه" if RED_CANDLE_USE_DAILY else "30m"
 
             caption = (
                 f"📈 ⚠️ [سهام آمریکا] هشدار ریزش از EMA!\n"
                 f"نماد: {display_name}\n"
-                f"تایم‌فریم EMA: 30m | تایم‌فریم کندل قرمز: {RED_CANDLE_TIMEFRAME}\n"
+                f"تایم‌فریم EMA: 30m | تایم‌فریم کندل قرمز: {red_tf_label}\n"
                 f"قیمت: {current_price:.2f}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
                 f"حجم کندل آخر (30m): {last_volume:,.0f} سهم\n"
-                f"ارزش تقریبی کندل آخر (30m): {last_value:,.2f} $\n"
+                f"ارزش تقریبی کندل آخر (30m): {last_value:,.0f} $\n"
                 f"نمودار تردینگ‌ویو: {tv_link}"
             )
             log(caption)
 
+            # ۱- نمودار ۶ ماهه (روزانه)
             chart_6m = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
             if chart_6m:
-                send_telegram_photo(chart_6m, caption)
-            else:
-                send_telegram_message(caption)
+                send_telegram_photo(chart_6m, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
 
+            # ۲- نمودار ۳۰ دقیقه‌ای، ۳ روز معاملاتی اخیر + EMA5 + Donchian + پیوت فیبوناچی
             try:
-                intraday_30m_df = yf.download(symbol, period="1d", interval="30m", progress=False)[
-                    ["Open", "High", "Low", "Close"]
-                ]
-                if not intraday_30m_df.empty:
-                    chart_30m = make_indicator_chart(
-                        intraday_30m_df, title=f"{symbol} - 1D 30m + EMA{EMA_PERIOD}", show_ema=True
-                    )
-                    if chart_30m:
-                        send_telegram_photo(chart_30m, f"⏱ {symbol} - نمودار ۱ روزه، تایم‌فریم ۳۰ دقیقه + EMA{EMA_PERIOD}")
+                display_bars_30m = min(13 * INTRADAY_DISPLAY_DAYS, len(data30))
+                chart_30m = build_indicator_chart(
+                    data30[["Open", "High", "Low", "Close"]], display_bars_30m,
+                    title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 30m",
+                    daily_df=daily_df, show_pivots=True,
+                )
+                if chart_30m:
+                    send_telegram_photo(chart_30m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز معاملاتی اخیر، تایم‌فریم ۳۰ دقیقه")
             except Exception as e:
                 log(f"خطا در ساخت نمودار ۳۰ دقیقه {symbol}: {e}")
 
+            # ۳- نمودار ۱۵ دقیقه‌ای، ۳ روز معاملاتی اخیر + EMA5 + Donchian + پیوت فیبوناچی
             try:
-                intraday_15m_df = yf.download(symbol, period="1d", interval="15m", progress=False)[
-                    ["Open", "High", "Low", "Close"]
-                ]
-                if not intraday_15m_df.empty:
-                    chart_15m = make_indicator_chart(
-                        intraday_15m_df,
-                        title=f"{symbol} - 1D 15m + EMA{EMA_PERIOD} + DC{DONCHIAN_PERIOD}",
-                        show_ema=True,
-                        show_donchian=True,
+                data15 = yf.download(symbol, period="5d", interval="15m", progress=False)
+                if not data15.empty:
+                    data15 = data15[["Open", "High", "Low", "Close"]].copy()
+                    display_bars_15m = min(26 * INTRADAY_DISPLAY_DAYS, len(data15))
+                    chart_15m = build_indicator_chart(
+                        data15, display_bars_15m,
+                        title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 15m",
+                        daily_df=daily_df, show_pivots=True,
                     )
                     if chart_15m:
-                        send_telegram_photo(
-                            chart_15m,
-                            f"⏱ {symbol} - نمودار ۱ روزه، تایم‌فریم ۱۵ دقیقه + EMA{EMA_PERIOD} + Donchian Channel({DONCHIAN_PERIOD})",
-                        )
+                        send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز معاملاتی اخیر، تایم‌فریم ۱۵ دقیقه")
             except Exception as e:
                 log(f"خطا در ساخت نمودار ۱۵ دقیقه {symbol}: {e}")
+
+            # ۴- در آخر، توضیحات کامل به‌صورت پیام متنی جدا
+            send_telegram_message(caption)
         except Exception as e:
             log(f"خطا در پردازش {symbol}: {e}")
 
@@ -632,29 +696,76 @@ def check_us_stocks_market():
             log(f"[سهام] {index}/{total} اسکن شد...")
         time.sleep(0.15)
 
-
 # ============================
-# بخش بورس تهران (TSETMC) - از کتابخانه‌ی مستندسازی‌شده‌ی algotik-tse استفاده میشه
+# بخش بورس تهران (TSETMC) - دو منبع مستقل برای اطمینان بیشتر
 # ============================
-# توجه: بورس تهران API رسمی و رایگان نداره؛ algotik-tse داده رو از tsetmc.com می‌خونه و
-# ممکنه به‌مرور با تغییرات اون سایت از کار بیفته. اگه خطا بده، فقط همین بخش غیرفعال میشه
+# منبع اول: algotik-tse (رتبه‌بندی زنده‌ی کل بازار + تاریخچه‌ی دسته‌جمعی)
+# منبع دوم: pytse-client (فقط برای پر کردن جا/جبران وقتی منبع اول برای یک نماد جواب نداد)
+# چون بورس تهران API رسمی و رایگان نداره، هر دو کتابخانه از tsetmc.com می‌خونن و ممکنه
+# به‌مرور با تغییرات اون سایت از کار بیفتن. اگه هردو خطا بدن، فقط همین بخش غیرفعال میشه
 # و بقیه‌ی ربات (کریپتو و سهام آمریکا) عادی کار می‌کنه.
 # چون داده‌ی درون‌روزی رسمی و پایدار برای بورس تهران در دسترس نیست، هم EMA و هم شرط
-# ۳ کندل قرمز روی تایم‌فریم روزانه محاسبه میشه. نمادها هر چرخه به‌صورت زنده بر اساس
-# حجم معاملات امروز رتبه‌بندی میشن (نه یه لیست ثابت دستی).
+# ۳ کندل قرمز همیشه روی تایم‌فریم روزانه محاسبه میشه.
 TSE_STOCK_TYPES = [300, 303, 309]  # کد نوع ابزار برای سهام عادی (بورس/فرابورس)
 
-
 def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
-    """گرفتن اسنپ‌شات لحظه‌ای کل بازار و برگردوندن N نماد پرحجم‌تر (فقط سهام عادی، نه صندوق/اختیار/اوراق)"""
+    """
+    گرفتن اسنپ‌شات لحظه‌ای کل بازار (منبع اول: algotik-tse) و برگردوندن N نماد پرحجم‌تر.
+    اگه به هر دلیل تعداد کمتر از limit شد، از لیست کامل نمادهای بورس تهران (منبع دوم:
+    pytse-client) برای تکمیل تا حد limit استفاده میشه -- تا مطمئن بشیم واقعاً به تعداد
+    درخواستی نماد بررسی میشه، نه کمتر.
+    """
     import algotik_tse as att
-    data = att.get_market_snapshot()
-    stocks_df = data["stocks"]
-    real = stocks_df[stocks_df["InstrumentType"].isin(TSE_STOCK_TYPES)].copy()
-    real = real.sort_values("Volume", ascending=False)
-    names = dict(zip(real["Symbol"], real["Name"]))
-    top_symbols = real["Symbol"].head(limit).tolist()
+    names = {}
+    top_symbols = []
+    try:
+        data = att.get_market_snapshot()
+        stocks_df = data["stocks"]
+        real = stocks_df[stocks_df["InstrumentType"].isin(TSE_STOCK_TYPES)].copy()
+        real = real.sort_values("Volume", ascending=False)
+        names = dict(zip(real["Symbol"], real["Name"]))
+        top_symbols = real["Symbol"].head(limit).tolist()
+    except Exception as e:
+        log(f"⚠️ منبع اول (algotik-tse) برای رتبه‌بندی بازار جواب نداد: {e}")
+
+    if len(top_symbols) < limit:
+        log(f"⚠️ فقط {len(top_symbols)} نماد از منبع اول اومد؛ تلاش برای تکمیل تا {limit} از منبع دوم (pytse-client)...")
+        try:
+            import pytse_client as tse
+            all_syms = tse.all_symbols()
+            existing = set(top_symbols)
+            for s in all_syms:
+                if len(top_symbols) >= limit:
+                    break
+                if s not in existing:
+                    top_symbols.append(s)
+                    existing.add(s)
+        except Exception as e:
+            log(f"⚠️ منبع دوم (pytse-client) هم برای تکمیل لیست جواب نداد: {e}")
+
+    log(f"[بورس تهران] در مجموع {len(top_symbols)} از {limit} نماد هدف آماده شد.")
     return top_symbols, names
+
+
+def get_tse_daily_df_fallback(symbol, limit=180):
+    """منبع دوم (pytse-client) برای گرفتن تاریخچه‌ی روزانه‌ی یک نماد، وقتی منبع اول جواب نداد"""
+    try:
+        import pytse_client as tse
+        ticker = tse.Ticker(symbol)
+        hist = ticker.history
+        if hist is None or len(hist) == 0:
+            return None
+        hist = hist.sort_values("date").tail(limit)
+        df = pd.DataFrame({
+            "Open": hist["open"].astype(float).values,
+            "High": hist["high"].astype(float).values,
+            "Low": hist["low"].astype(float).values,
+            "Close": hist["close"].astype(float).values,
+        }, index=pd.to_datetime(hist["date"].values))
+        return df
+    except Exception as e:
+        log(f"خطا در منبع دوم (pytse-client) برای {symbol}: {e}")
+        return None
 
 
 def check_tehran_stocks_market():
@@ -670,24 +781,35 @@ def check_tehran_stocks_market():
         log(f"خطا در دریافت اسنپ‌شات بازار بورس تهران: {e}")
         return
 
-    total = len(top_symbols)
-    log(f"[بورس تهران] {total} نماد برتر (بر اساس حجم امروز) پیدا شد.")
+    if len(top_symbols) < TSE_RANK_LIMIT:
+        log(f"⚠️⚠️ هشدار: در نهایت فقط {len(top_symbols)} نماد بورس تهران (از {TSE_RANK_LIMIT} هدف) در دسترس بود.")
 
-    # دریافت دسته‌جمعی ۱۰ روز آخر برای همه‌ی نمادها در یک درخواست (به‌جای ۲۰۰ درخواست جدا)
+    total = len(top_symbols)
+
+    # دریافت دسته‌جمعی ۱۰ روز آخر برای همه‌ی نمادها در یک درخواست (منبع اول، به‌جای N درخواست جدا)
+    hist_all = None
     try:
         hist_all = att.get_history(top_symbols, limit=10, progress=False, dropna=False)
     except Exception as e:
-        log(f"خطا در دریافت تاریخچه‌ی دسته‌جمعی بورس تهران: {e}")
-        return
+        log(f"⚠️ خطا در دریافت تاریخچه‌ی دسته‌جمعی از منبع اول: {e}")
 
     for index, symbol in enumerate(top_symbols, 1):
         try:
-            if symbol not in hist_all.columns.get_level_values(1):
-                continue
-            opens = hist_all[("Open", symbol)].dropna().tolist()
-            closes = hist_all[("Close", symbol)].dropna().tolist()
+            opens, closes = [], []
+            got_from_batch = (
+                hist_all is not None and symbol in hist_all.columns.get_level_values(1)
+            )
+            if got_from_batch:
+                opens = hist_all[("Open", symbol)].dropna().tolist()
+                closes = hist_all[("Close", symbol)].dropna().tolist()
+
+            # اگه منبع اول برای این نماد جواب نداد، برو سراغ منبع دوم
             if len(closes) < 4:
-                continue
+                fallback_df = get_tse_daily_df_fallback(symbol, limit=10)
+                if fallback_df is None or len(fallback_df) < 4:
+                    continue
+                opens = fallback_df["Open"].tolist()
+                closes = fallback_df["Close"].tolist()
 
             current_price = closes[-1]
             ema_value = calculate_ema(closes, EMA_PERIOD)
@@ -705,8 +827,14 @@ def check_tehran_stocks_market():
                 if not had_three_red_candles_before_last(opens, closes):
                     continue
 
-            # نمودار ۶ ماهه‌ی جداگانه فقط برای نمادی که واجد شرایط شده
-            daily_df = att.get_history(symbol, limit=180, progress=False)
+            # نمودار ۶ ماهه‌ی جداگانه فقط برای نمادی که واجد شرایط شده -- اول منبع اول، بعد منبع دوم
+            daily_df = None
+            try:
+                daily_df = att.get_history(symbol, limit=180, progress=False)
+            except Exception as e:
+                log(f"منبع اول برای نمودار ۶ ماهه‌ی {symbol} جواب نداد: {e}")
+            if daily_df is None or len(daily_df) < 4:
+                daily_df = get_tse_daily_df_fallback(symbol, limit=180)
             if daily_df is None or len(daily_df) < 4:
                 continue
 
@@ -724,9 +852,9 @@ def check_tehran_stocks_market():
 
             chart = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
             if chart:
-                send_telegram_photo(chart, caption)
-            else:
-                send_telegram_message(caption)
+                send_telegram_photo(chart, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
+
+            send_telegram_message(caption)
         except Exception as e:
             log(f"خطا در پردازش نماد بورس تهران {symbol}: {e}")
 
