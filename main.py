@@ -16,7 +16,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -3          # درصد افت از EMA برای صدور هشدار
+DIFF_THRESHOLD = -1          # درصد افت از EMA برای صدور هشدار
 REQUIRE_RED_CANDLES = True   # شرط ۳ کندل قرمز -- برای غیرفعال کردن کامل، این رو False کنید
 RED_CANDLE_USE_DAILY = False  # True = شرط روی کندل روزانه | False = شرط روی کندل ۳۰ دقیقه (فقط کریپتو/سهام آمریکا؛ بورس تهران همیشه daily)
 DONCHIAN_PERIOD = 20         # دوره‌ی استاندارد اندیکاتور Donchian Channel
