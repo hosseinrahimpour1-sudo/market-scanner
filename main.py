@@ -23,7 +23,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -7          # <-- خودتون عوض کنید (مثلاً -7 یعنی ۷٪ زیر EMA5)
+DIFF_THRESHOLD = -7          # <-- خودتون عووض کنید (مثلاً -7 یعنی ۷٪ زیر EMA5)
 REQUIRE_RED_CANDLES = True
 RED_CANDLE_USE_DAILY = False
 INTRADAY_DISPLAY_DAYS = 2
