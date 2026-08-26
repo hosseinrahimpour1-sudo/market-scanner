@@ -1,8 +1,1 @@
-requests
-pandas
-mplfinance
-yfinance
-algotik-tse
-pytse-client
-
 
