@@ -23,10 +23,10 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -1          # <-- خودتون عووض کنید (مثلاً -7 یعنی ۷٪ زیر EMA5)
+DIFF_THRESHOLD = -7          # <-- خودتون عوض کنید (مثلاً -7 یعنی ۷٪ زیر EMA5)
 REQUIRE_RED_CANDLES = True
 RED_CANDLE_USE_DAILY = False
-INTRADAY_DISPLAY_DAYS = 2
+INTRADAY_DISPLAY_DAYS = 1.5
 CYCLE_SECONDS = 300
 REQUEST_TIMEOUT = 15
 CRYPTO_RANK_LIMIT = 300
@@ -185,6 +185,11 @@ def get_tradingview_link(symbol, market):
     return f"https://www.tradingview.com/chart/?symbol={quote(symbol)}"
 
 
+def format_price_for_callback(price):
+    """فرمت فشرده‌ی قیمت برای جا شدن داخل محدودیت ۶۴ بایتی callback_data تلگرام."""
+    return format(price, ".8g")
+
+
 def get_binance_link(symbol):
     if symbol.endswith("USDT"):
         base = symbol[:-4]
@@ -297,6 +302,7 @@ def send_telegram_photo(image_bytes, caption, _retry=True):
         log(f"خطا در ارسال عکس: {e}")
         send_telegram_message(caption)
 
+
 def answer_callback_query(callback_id, text, show_alert=False):
     try:
         _telegram_post("answerCallbackQuery", data={
@@ -304,7 +310,6 @@ def answer_callback_query(callback_id, text, show_alert=False):
         })
     except Exception as e:
         log(f"خطا در answerCallbackQuery: {e}")
-
 
 def remove_message_buttons(chat_id, message_id):
     """دکمه‌های زیر یه پیام رو حذف می‌کنه تا کاربر نتونه دوباره روشون کلیک کنه (جلوگیری از سفارش تکراری)."""
@@ -351,6 +356,14 @@ def calculate_ema(prices, period):
 
 def calculate_ema_series(close_series, period=EMA_PERIOD):
     return close_series.ewm(span=period, adjust=False).mean()
+
+
+def compute_ema_diff_percent(closes, period=EMA_PERIOD):
+    """درصد فاصله‌ی آخرین قیمت با EMA همون سری قیمت (برای برچسب‌گذاری روی نمودار روزانه)."""
+    ema_value = calculate_ema(closes, period)
+    if not ema_value:
+        return None
+    return ((closes[-1] - ema_value) / ema_value) * 100
 
 
 def had_three_red_candles_before_last(opens, closes):
@@ -429,8 +442,44 @@ PIVOT_COLORS = {
 # سطوحی که مبنای استراتژی ورودن (S2/S3) پررنگ‌تر و با برچسب عددی روی نمودار رسم میشن
 KEY_PIVOT_LEVELS = ("S2", "S3")
 
+# --- اندیکاتور Donchian Channel (فقط برای نمودار ۴ ماهه‌ی روزانه) -----------
+DC_PERIOD = 20
 
-def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivots=False):
+
+def calculate_donchian_channel(df, period=DC_PERIOD):
+    """بالاترین High و پایین‌ترین Low طی period کندل اخیر (کانال دونچیان)."""
+    upper = df["High"].rolling(window=period, min_periods=1).max()
+    lower = df["Low"].rolling(window=period, min_periods=1).min()
+    return upper, lower
+
+
+def add_ema_diff_annotation(ax, df_display, diff_percent):
+    """
+    عدد اختلاف درصد قیمت آخر با EMA5 رو به‌صورت یه برچسب داخل پرانتز، زیر
+    دهمین کندل قبل از آخرین کندل نمودار می‌ذاره (فونت ۲ برابر برچسب‌های دیگه).
+    """
+    if diff_percent is None:
+        return
+    try:
+        n = len(df_display)
+        if n == 0:
+            return
+        idx = n - 10 if n >= 10 else 0
+        candle_low = float(df_display["Low"].iloc[idx])
+        sign = "+" if diff_percent >= 0 else ""
+        ax.annotate(
+            f"({sign}{diff_percent:.2f}%)",
+            xy=(idx, candle_low), xycoords="data",
+            xytext=(0, -22), textcoords="offset points",
+            color="#000000", fontsize=20, fontweight="bold",
+            ha="center", va="top",
+        )
+    except Exception as e:
+        log(f"خطا در قرار دادن برچسب اختلاف EMA روی نمودار: {e}")
+
+
+def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivots=False,
+                           diff_percent_annotation=None):
     """
     نمودار شمعی «فقط با EMA5 + پیوت» -- هیچ اندیکاتور اضافه‌ای (حجم و غیره) رسم نمیشه.
     خطوط S2 و S3 (مبنای ورود به معامله طبق استراتژی) پررنگ‌تر و با برچسب عددی دقیق
@@ -477,6 +526,8 @@ def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivo
                     bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=PIVOT_COLORS[level], alpha=0.85),
                 )
 
+        add_ema_diff_annotation(ax, df_display, diff_percent_annotation)
+
         fig.savefig(buf, dpi=140, bbox_inches="tight")
         buf.seek(0)
         return buf
@@ -485,16 +536,35 @@ def build_indicator_chart(df_full, display_bars, title, daily_df=None, show_pivo
         return None
 
 
-def make_candlestick_chart(df, title=""):
+def make_candlestick_chart(df, title="", show_dc=False, diff_percent_annotation=None):
+    """
+    نمودار شمعی روزانه. با show_dc=True، کانال دونچیان (DC) هم روی نمودار رسم میشه.
+    با پر کردن diff_percent_annotation، درصد فاصله‌ی قیمت آخر تا EMA5 (محاسبه‌شده
+    روی همین تایم‌فریم روزانه) زیر دهمین کندل قبل از آخر نوشته میشه.
+    """
     buf = io.BytesIO()
     try:
-        mpf.plot(df, type="candle", style="charles", volume=False, title=title,
-                  figsize=(11, 6), savefig=dict(fname=buf, dpi=140, bbox_inches="tight"))
+        addplots = []
+        if show_dc and len(df) > 0:
+            dc_upper, dc_lower = calculate_donchian_channel(df, DC_PERIOD)
+            addplots.append(mpf.make_addplot(dc_upper, color="#1f77b4", width=1.1, linestyle="--"))
+            addplots.append(mpf.make_addplot(dc_lower, color="#ff7f0e", width=1.1, linestyle="--"))
+
+        fig, axes = mpf.plot(
+            df, type="candle", style="charles", volume=False, title=title,
+            figsize=(11, 6), addplot=addplots if addplots else None, returnfig=True,
+        )
+        ax = axes[0]
+
+        add_ema_diff_annotation(ax, df, diff_percent_annotation)
+
+        fig.savefig(buf, dpi=140, bbox_inches="tight")
         buf.seek(0)
         return buf
     except Exception as e:
         log(f"خطا در ساخت نمودار: {e}")
         return None
+
 
 # ==================================================================
 # بخش ۶: دقت اعشار بایننس (LOT_SIZE / PRICE_FILTER / tickSize)
@@ -557,7 +627,6 @@ def format_binance_price(symbol, price):
         return round(price, 6)
     pf = filters["PRICE_FILTER"]
     return _round_to_step(price, pf["tickSize"])
-
 
 # ==================================================================
 # بخش ۷: تفسیر خطاهای بایننس/نوبیتکس به پیام قابل‌فهم
@@ -696,6 +765,7 @@ def nobitex_place_limit_order(base_currency, order_type, amount, price):
                        timeout=REQUEST_TIMEOUT)
     return r.json()
 
+
 def nobitex_place_stop_loss_order(base_currency, amount, stop_price):
     """
     نکته: ساختار API سفارش استاپ نوبیتکس ممکنه در طول زمان تغییر کنه. این پیاده‌سازی
@@ -802,12 +872,25 @@ def compute_monthly_pnl():
 #      هر دو به‌صورت خودکار ثبت میشن.
 #   هر دو مرحله: چک هویت (فقط آیدی‌های مجاز) + idempotency (هر پیام فقط یک‌بار قابل کلیکه).
 # ==================================================================
-def execute_buy_with_protection(exchange, symbol_or_base, sl_percent):
+def execute_buy_with_protection(exchange, symbol_or_base, sl_percent, limit_price=None):
+    """
+    وقتی limit_price داده بشه (کف آخرین کندل ۱۵ دقیقه‌ای، طبق استراتژی)، خرید به‌صورت
+    سفارش LIMIT دقیقاً روی همون قیمت ثبت میشه -- نه سفارش مارکت با قیمت لحظه‌ای.
+    """
     try:
         if exchange == "binance":
-            buy_result = binance_place_order(symbol_or_base, "BUY", TEST_TRADE_AMOUNT_USDT)
+            if limit_price:
+                buy_price = format_binance_price(symbol_or_base, limit_price)
+                quantity = format_binance_quantity(symbol_or_base, TEST_TRADE_AMOUNT_USDT / buy_price)
+                buy_result = binance_place_limit_order(symbol_or_base, "BUY", quantity, buy_price)
+            else:
+                buy_result = binance_place_order(symbol_or_base, "BUY", TEST_TRADE_AMOUNT_USDT)
         elif exchange == "nobitex":
-            buy_result = nobitex_place_order(symbol_or_base, "buy", TEST_TRADE_AMOUNT_USDT)
+            if limit_price:
+                amount = round(TEST_TRADE_AMOUNT_USDT / limit_price, 6)
+                buy_result = nobitex_place_limit_order(symbol_or_base, "buy", amount, limit_price)
+            else:
+                buy_result = nobitex_place_order(symbol_or_base, "buy", TEST_TRADE_AMOUNT_USDT)
         else:
             send_telegram_message("صرافی ناشناخته.")
             return
@@ -818,7 +901,9 @@ def execute_buy_with_protection(exchange, symbol_or_base, sl_percent):
             send_telegram_message(f"❌ خرید {symbol_or_base} در {exchange} ناموفق بود.\n{buy_error}")
             return
 
-        entry_price = get_current_price(exchange, symbol_or_base)
+        # برای سفارش لیمیت، مبنای محاسبه‌ی حد سود/ضرر همون قیمتیه که سفارش روش ثبت شده
+        # (نه لزوماً قیمت لحظه‌ای بازار، چون سفارش لیمیته و ممکنه هنوز پر نشده باشه)
+        entry_price = limit_price if limit_price else get_current_price(exchange, symbol_or_base)
         if not entry_price:
             send_telegram_message(
                 f"❌ سفارش خرید ارسال شد ولی قیمت ورود برای محاسبه‌ی حد سود/ضرر پیدا نشد.\nنتیجه: {buy_result}"
@@ -851,9 +936,11 @@ def execute_buy_with_protection(exchange, symbol_or_base, sl_percent):
                               take_profit_price, stop_loss_price)
 
         mode_label = "🧪 حالت آزمایشی (DRY_RUN)" if DRY_RUN else "✅ سفارش واقعی ارسال شد"
+        order_type_label = "لیمیت (کف کندل ۱۵ دقیقه)" if limit_price else "مارکت"
         caption = (
             f"{mode_label}\n"
             f"صرافی: {exchange} | نماد: {symbol_or_base}\n"
+            f"نوع سفارش خرید: {order_type_label}\n"
             f"قیمت خرید: {entry_price}\n"
             f"حد سود ({TAKE_PROFIT_PERCENT}%): {take_profit_price:.6f}\n"
             f"حد ضرر ({sl_percent}%): {stop_loss_price:.6f}\n"
@@ -885,35 +972,44 @@ def handle_callback_query(callback_query):
         answer_callback_query(callback_id, "⛔ شما اجازه‌ی استفاده از این دکمه رو ندارید.", show_alert=True)
         return
 
-    if parts and parts[0] == "buy" and len(parts) == 3:
+    if parts and parts[0] == "buy" and len(parts) == 4:
         if mark_consumed_and_check(chat_id, message_id):
             answer_callback_query(callback_id, "این هشدار قبلاً پردازش شده.", show_alert=True)
             return
         remove_message_buttons(chat_id, message_id)
-        _, exchange, symbol_or_base = parts
+        _, exchange, symbol_or_base, price_str = parts
+        try:
+            limit_price = float(price_str)
+        except ValueError:
+            answer_callback_query(callback_id, "قیمت سفارش نامعتبره.", show_alert=True)
+            return
         answer_callback_query(callback_id, "لطفاً درصد حد ضرر رو انتخاب کنید.")
         sl_buttons = [
-            [{"text": f"🛑 حد ضرر {p}%", "callback_data": f"slbuy:{exchange}:{symbol_or_base}:{p}"}]
+            [{"text": f"🛑 حد ضرر {p}%", "callback_data": f"slbuy:{exchange}:{symbol_or_base}:{p}:{price_str}"}]
             for p in STOP_LOSS_OPTIONS
         ]
         send_telegram_message_with_buttons(
-            f"برای خرید {symbol_or_base} در {exchange}، درصد مجاز ضرر (حد ضرر) رو انتخاب کنید:",
+            f"برای خرید {symbol_or_base} در {exchange} با سفارش لیمیت روی کف آخرین کندل ۱۵ دقیقه‌ای "
+            f"({limit_price})، درصد مجاز ضرر (حد ضرر) رو انتخاب کنید:",
             sl_buttons,
-        )
-
-    elif parts and parts[0] == "slbuy" and len(parts) == 4:
+    )
+        
+    elif parts and parts[0] == "slbuy" and len(parts) == 5:
         if mark_consumed_and_check(chat_id, message_id):
             answer_callback_query(callback_id, "این سفارش قبلاً پردازش شده.", show_alert=True)
             return
         remove_message_buttons(chat_id, message_id)
-        _, exchange, symbol_or_base, sl_percent_str = parts
+        _, exchange, symbol_or_base, sl_percent_str, price_str = parts
         try:
             sl_percent = float(sl_percent_str)
+            limit_price = float(price_str)
         except ValueError:
-            answer_callback_query(callback_id, "درصد حد ضرر نامعتبره.", show_alert=True)
+            answer_callback_query(callback_id, "درصد حد ضرر یا قیمت سفارش نامعتبره.", show_alert=True)
             return
-        answer_callback_query(callback_id, f"⏳ در حال خرید {symbol_or_base} در {exchange} (حد ضرر {sl_percent}%)...")
-        execute_buy_with_protection(exchange, symbol_or_base, sl_percent)
+        answer_callback_query(
+            callback_id, f"⏳ در حال ثبت سفارش لیمیت خرید {symbol_or_base} در {exchange} @ {limit_price} (حد ضرر {sl_percent}%)..."
+        )
+        execute_buy_with_protection(exchange, symbol_or_base, sl_percent, limit_price)
 
     elif parts and parts[0] == "pnl" and len(parts) == 2:
         trade_id = parts[1]
@@ -970,7 +1066,7 @@ def get_top_ranked_usdt_symbols(limit=CRYPTO_RANK_LIMIT):
         return []
 
 
-def get_crypto_daily_df(symbol, limit=180):
+def get_crypto_daily_df(symbol, limit=120):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit={limit}"
     try:
         response = requests.get(url, timeout=REQUEST_TIMEOUT).json()
@@ -995,7 +1091,7 @@ def get_crypto_intraday_df(symbol, interval, limit):
         if not isinstance(response, list) or len(response) == 0:
             return None
         df = pd.DataFrame(response, columns=["open_time", "open", "high", "low", "close", "volume",
-                                                      "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"])
+                                              "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"])
         df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
         df.set_index("open_time", inplace=True)
         df = df[["open", "high", "low", "close"]].astype(float)
@@ -1021,7 +1117,6 @@ def check_crypto_market():
             opens30 = [float(c[1]) for c in response]
             closes = [float(c[4]) for c in response]
             volumes = [float(c[5]) for c in response]
-            quote_values = [float(c[7]) for c in response]
             current_price = closes[-1]
 
             ema_value = calculate_ema(closes, EMA_PERIOD)
@@ -1045,14 +1140,16 @@ def check_crypto_market():
                 if not red_check_ok:
                     continue
 
-            pivot_level = pivot_value = None
-            if REQUIRE_PIVOT_CONDITION:
-                prev_day = daily_df.iloc[-2]
-                pivot_ok, pivot_level, pivot_value = price_reached_pivot_support(
-                    current_price, prev_day["High"], prev_day["Low"], prev_day["Close"]
-                )
-                if not pivot_ok:
-                    continue
+            # شرط پیوت همیشه محاسبه میشه (حتی اگه REQUIRE_PIVOT_CONDITION خاموش باشه)
+            # چون نمودار ۱۵ دقیقه‌ای، جدا از این سوییچ، فقط وقتی باید نشون داده بشه
+            # که قیمت واقعاً به S2/S3 رسیده باشه.
+            pivot_ok, pivot_level, pivot_value = False, None, None
+            prev_day = daily_df.iloc[-2]
+            pivot_ok, pivot_level, pivot_value = price_reached_pivot_support(
+                current_price, prev_day["High"], prev_day["Low"], prev_day["Close"]
+            )
+            if REQUIRE_PIVOT_CONDITION and not pivot_ok:
+                continue
 
             if should_suppress_repeat_alert(f"crypto:{symbol}", diff_percent):
                 continue
@@ -1076,43 +1173,58 @@ def check_crypto_market():
                 f"قیمت: {current_price}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
-                f"حجم کندل آخر (30m): {volumes[-1]:,.0f} {base_currency}\n"
-                f"ارزش کندل آخر (30m): {quote_values[-1]:,.0f} USDT\n"
                 f"نمودار تردینگ‌ویو: {tv_link}\n"
                 f"نمودار بایننس: {binance_link}\n"
                 f"{broker_lines}"
             )
             log(caption)
 
-            chart_6m = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
-            if chart_6m:
-                send_telegram_photo(chart_6m, f"📊 نمودار ۶ ماهه (روزانه) - {symbol}")
+            daily_diff_percent = compute_ema_diff_percent(daily_df["Close"].tolist())
+            chart_4m = make_candlestick_chart(daily_df.tail(120), title=f"{symbol} - 4M Daily",
+                                               show_dc=True, diff_percent_annotation=daily_diff_percent)
+            if chart_4m:
+                send_telegram_photo(chart_4m, f"📊 نمودار ۴ ماهه (روزانه) - {symbol}")
                 time.sleep(0.4)
 
-            buf_30m = get_crypto_intraday_df(symbol, "30m", 48 * INTRADAY_DISPLAY_DAYS + 30)
+            buf_30m = get_crypto_intraday_df(symbol, "30m", int(48 * INTRADAY_DISPLAY_DAYS + 30))
             if buf_30m is not None:
-                chart_30m = build_indicator_chart(buf_30m, 48 * INTRADAY_DISPLAY_DAYS,
+                chart_30m = build_indicator_chart(buf_30m, int(48 * INTRADAY_DISPLAY_DAYS),
                                                    title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 30m",
-                                                   daily_df=daily_df, show_pivots=True)
+                                                   daily_df=daily_df, show_pivots=True,
+                                                   diff_percent_annotation=diff_percent)
                 if chart_30m:
                     send_telegram_photo(chart_30m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۳۰ دقیقه")
                     time.sleep(0.4)
 
-            buf_15m = get_crypto_intraday_df(symbol, "15m", 96 * INTRADAY_DISPLAY_DAYS + 30)
-            if buf_15m is not None:
-                chart_15m = build_indicator_chart(buf_15m, 96 * INTRADAY_DISPLAY_DAYS,
-                                                   title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 15m",
-                                                   daily_df=daily_df, show_pivots=True)
-                if chart_15m:
-                    send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۱۵ دقیقه")
-                    time.sleep(0.4)
+            # نمودار ۱۵ دقیقه فقط وقتی ارسال میشه که قیمت واقعاً به S2 یا S3 رسیده باشه
+            # کف همین کندل ۱۵ دقیقه‌ای (last_low_15m) بعداً به‌عنوان قیمت سفارش لیمیت خرید استفاده میشه
+            last_low_15m = None
+            if pivot_ok:
+                buf_15m = get_crypto_intraday_df(symbol, "15m", int(96 * INTRADAY_DISPLAY_DAYS + 30))
+                if buf_15m is not None and len(buf_15m) > 0:
+                    last_low_15m = float(buf_15m["Low"].iloc[-1])
+                    chart_15m = build_indicator_chart(buf_15m, int(96 * INTRADAY_DISPLAY_DAYS),
+                                                       title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 15m",
+                                                       daily_df=daily_df, show_pivots=True)
+                    if chart_15m:
+                        send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۱۵ دقیقه")
+                        time.sleep(0.4)
 
-            buy_buttons = [[{"text": "🟢 خرید آزمایشی در بایننس", "callback_data": f"buy:binance:{symbol}"}]]
-            for broker_name, _ in broker_links:
-                if broker_name == "نوبیتکس":
-                    buy_buttons.append([{"text": "🟢 خرید آزمایشی در نوبیتکس",
-                                          "callback_data": f"buy:nobitex:{base_currency}"}])
-            send_telegram_message_with_buttons(caption, buy_buttons)
+            # دکمه‌ی خرید فقط وقتی نشون داده میشه که کف کندل ۱۵ دقیقه (قیمت سفارش لیمیت) در دسترس باشه
+            if last_low_15m:
+                price_str = format_price_for_callback(last_low_15m)
+                buy_buttons = [[{"text": "🟢 خرید لیمیت آزمایشی در بایننس (کف کندل ۱۵د)",
+                                  "callback_data": f"buy:binance:{symbol}:{price_str}"}]]
+                # دکمه‌ی نوبیتکس فقط وقتی اضافه میشه که get_iran_broker_links تایید کنه این جفت‌ارز
+                # همین الان توی نوبیتکس فعاله (بروکرهای دیگه مثل والکس چون اتصال معاملاتی پیاده‌سازی
+                # نشده، دکمه‌ی خرید ندارن -- فقط لینکشون توی caption میاد)
+                for broker_name, _ in broker_links:
+                    if broker_name == "نوبیتکس":
+                        buy_buttons.append([{"text": "🟢 خرید لیمیت آزمایشی در نوبیتکس (کف کندل ۱۵د)",
+                                              "callback_data": f"buy:nobitex:{base_currency}:{price_str}"}])
+                send_telegram_message_with_buttons(caption, buy_buttons)
+            else:
+                send_telegram_message(caption)
 
         except Exception as e:
             log(f"خطا در پردازش {symbol}: {e}")
@@ -1133,7 +1245,6 @@ def check_us_stocks_market():
     symbols = get_top100_us_symbols()
     total = len(symbols)
     log(f"[سهام] {total} نماد پیدا شد.")
-
     for index, symbol in enumerate(symbols, 1):
         try:
             data30 = yf.download(symbol, period="5d", interval="30m", progress=False)
@@ -1156,7 +1267,7 @@ def check_us_stocks_market():
             if had_zero_volume_recently(volumes):
                 continue
 
-            daily_data = yf.download(symbol, period="6mo", interval="1d", progress=False)
+            daily_data = yf.download(symbol, period="4mo", interval="1d", progress=False)
             if daily_data.empty or len(daily_data) < 4:
                 continue
             daily_df = daily_data[["Open", "High", "Low", "Close"]].copy()
@@ -1172,14 +1283,16 @@ def check_us_stocks_market():
                 if not red_check_ok:
                     continue
 
-            pivot_level = pivot_value = None
-            if REQUIRE_PIVOT_CONDITION:
-                prev_day = daily_df.iloc[-2]
-                pivot_ok, pivot_level, pivot_value = price_reached_pivot_support(
-                    current_price, prev_day["High"], prev_day["Low"], prev_day["Close"]
-                )
-                if not pivot_ok:
-                    continue
+            # شرط پیوت همیشه محاسبه میشه (حتی اگه REQUIRE_PIVOT_CONDITION خاموش باشه)
+            # چون نمودار ۱۵ دقیقه‌ای، جدا از این سوییچ، فقط وقتی باید نشون داده بشه
+            # که قیمت واقعاً به S2/S3 رسیده باشه.
+            pivot_ok, pivot_level, pivot_value = False, None, None
+            prev_day = daily_df.iloc[-2]
+            pivot_ok, pivot_level, pivot_value = price_reached_pivot_support(
+                current_price, prev_day["High"], prev_day["Low"], prev_day["Close"]
+            )
+            if REQUIRE_PIVOT_CONDITION and not pivot_ok:
+                continue
 
             if should_suppress_repeat_alert(f"stock:{symbol}", diff_percent):
                 continue
@@ -1187,8 +1300,6 @@ def check_us_stocks_market():
             display_name = get_display_name(symbol, STOCK_NAMES)
             tv_link = get_tradingview_link(symbol, "stock")
 
-            last_volume = volumes[-1]
-            last_value = last_volume * current_price
             red_tf_label = "روزانه" if RED_CANDLE_USE_DAILY else "30m"
             pivot_line = f"شرط پیوت ({PIVOT_TYPE}): قیمت به {pivot_level} رسید ({pivot_value:.6f})\n" if pivot_level else ""
 
@@ -1201,24 +1312,25 @@ def check_us_stocks_market():
                 f"قیمت: {current_price:.2f}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
-                f"حجم کندل آخر (30m): {last_volume:,.0f} سهم\n"
-                f"ارزش تقریبی کندل آخر (30m): {last_value:,.0f} $\n"
                 f"نمودار تردینگ‌ویو: {tv_link}\n"
                 f"⚠️ خرید مستقیم برای این بازار پشتیبانی نمیشه (فقط اطلاع‌رسانی)."
             )
             log(caption)
 
-            chart_6m = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
-            if chart_6m:
-                send_telegram_photo(chart_6m, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
+            daily_diff_percent = compute_ema_diff_percent(daily_df["Close"].tolist())
+            chart_4m = make_candlestick_chart(daily_df.tail(120), title=f"{symbol} - 4M Daily",
+                                               show_dc=True, diff_percent_annotation=daily_diff_percent)
+            if chart_4m:
+                send_telegram_photo(chart_4m, f"📊 {symbol} - نمودار ۴ ماهه (روزانه)")
                 time.sleep(0.4)
 
             try:
-                display_bars_30m = min(13 * INTRADAY_DISPLAY_DAYS, len(data30))
+                display_bars_30m = int(min(13 * INTRADAY_DISPLAY_DAYS, len(data30)))
                 chart_30m = build_indicator_chart(
                     data30[["Open", "High", "Low", "Close"]], display_bars_30m,
                     title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 30m",
                     daily_df=daily_df, show_pivots=True,
+                    diff_percent_annotation=diff_percent,
                 )
                 if chart_30m:
                     send_telegram_photo(chart_30m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز معاملاتی اخیر، تایم‌فریم ۳۰ دقیقه")
@@ -1226,21 +1338,23 @@ def check_us_stocks_market():
             except Exception as e:
                 log(f"خطا در ساخت نمودار ۳۰ دقیقه {symbol}: {e}")
 
-            try:
-                data15 = yf.download(symbol, period="5d", interval="15m", progress=False)
-                if not data15.empty:
-                    data15 = data15[["Open", "High", "Low", "Close"]].copy()
-                    display_bars_15m = min(26 * INTRADAY_DISPLAY_DAYS, len(data15))
-                    chart_15m = build_indicator_chart(
-                        data15, display_bars_15m,
-                        title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 15m",
-                        daily_df=daily_df, show_pivots=True,
-                    )
-                    if chart_15m:
-                        send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز معاملاتی اخیر، تایم‌فریم ۱۵ دقیقه")
-                        time.sleep(0.4)
-            except Exception as e:
-                log(f"خطا در ساخت نمودار ۱۵ دقیقه {symbol}: {e}")
+            # نمودار ۱۵ دقیقه فقط وقتی ارسال میشه که قیمت واقعاً به S2 یا S3 رسیده باشه
+            if pivot_ok:
+                try:
+                    data15 = yf.download(symbol, period="5d", interval="15m", progress=False)
+                    if not data15.empty:
+                        data15 = data15[["Open", "High", "Low", "Close"]].copy()
+                        display_bars_15m = int(min(26 * INTRADAY_DISPLAY_DAYS, len(data15)))
+                        chart_15m = build_indicator_chart(
+                            data15, display_bars_15m,
+                            title=f"{symbol} - {INTRADAY_DISPLAY_DAYS}D 15m",
+                            daily_df=daily_df, show_pivots=True,
+                        )
+                        if chart_15m:
+                            send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز معاملاتی اخیر، تایم‌فریم ۱۵ دقیقه")
+                            time.sleep(0.4)
+                except Exception as e:
+                    log(f"خطا در ساخت نمودار ۱۵ دقیقه {symbol}: {e}")
 
             send_telegram_message(caption)
         except Exception as e:
@@ -1257,7 +1371,7 @@ def check_us_stocks_market():
 # چون داده‌ی درون‌روزی رسمی برای بورس تهران در دسترس نیست، EMA و شرط
 # ۳ کندل قرمز همیشه روی تایم‌فریم روزانه محاسبه میشه.
 # ==================================================================
-def get_tse_daily_df_fallback(symbol, limit=180):
+def get_tse_daily_df_fallback(symbol, limit=120):
     try:
         import pytse_client as tse
         ticker = tse.Ticker(symbol)
@@ -1306,6 +1420,7 @@ def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
 
     log(f"[بورس تهران] در مجموع {len(top_symbols)} از {limit} نماد هدف آماده شد.")
     return top_symbols, names
+
 
 def check_tehran_stocks_market():
     try:
@@ -1366,11 +1481,11 @@ def check_tehran_stocks_market():
 
             daily_df = None
             try:
-                daily_df = att.get_history(symbol, limit=180, progress=False)
+                daily_df = att.get_history(symbol, limit=120, progress=False)
             except Exception as e:
-                log(f"منبع اول برای نمودار ۶ ماهه‌ی {symbol} جواب نداد: {e}")
+                log(f"منبع اول برای نمودار ۴ ماهه‌ی {symbol} جواب نداد: {e}")
             if daily_df is None or len(daily_df) < 4:
-                daily_df = get_tse_daily_df_fallback(symbol, limit=180)
+                daily_df = get_tse_daily_df_fallback(symbol, limit=120)
             if daily_df is None or len(daily_df) < 4:
                 continue
 
@@ -1398,9 +1513,10 @@ def check_tehran_stocks_market():
             )
             log(caption)
 
-            chart = make_candlestick_chart(daily_df, title=f"{symbol} - 6M Daily")
+            chart = make_candlestick_chart(daily_df.tail(120), title=f"{symbol} - 4M Daily",
+                                            show_dc=True, diff_percent_annotation=diff_percent)
             if chart:
-                send_telegram_photo(chart, f"📊 {symbol} - نمودار ۶ ماهه (روزانه)")
+                send_telegram_photo(chart, f"📊 {symbol} - نمودار ۴ ماهه (روزانه)")
                 time.sleep(0.4)
 
             send_telegram_message(caption)
@@ -1409,7 +1525,6 @@ def check_tehran_stocks_market():
 
         if index % 40 == 0:
             log(f"[بورس تهران] {index}/{total} اسکن شد...")
-
 
 # ==================================================================
 # بخش ۱۴: حلقه اصلی برنامه
@@ -1451,4 +1566,3 @@ if __name__ == "__main__":
         if remaining > 0:
             log(f"در حال استراحت به مدت {remaining:.1f} ثانیه...")
             time.sleep(remaining)
-
