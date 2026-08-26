@@ -8,6 +8,8 @@ import hashlib
 import sqlite3
 import threading
 import traceback
+import contextlib
+import concurrent.futures
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import quote
 
@@ -16,6 +18,31 @@ import pandas as pd
 import mplfinance as mpf
 import yfinance as yf
 
+
+def _run_with_timeout(func, timeout, *args, **kwargs):
+    """
+    یه تابع رو با یه مهلت زمانی سخت اجرا می‌کنه (مستقل از تایم‌اوت داخلی خودِ
+    تابع/کتابخانه). اگه کتابخانه‌ی زیرین (مثل algotik-tse) روی هاست از کار
+    افتاده‌ای گیر کنه و کلی طول بکشه تا Retry هاش تموم بشه، این تابع بعد از
+    `timeout` ثانیه ول می‌کنه و ادامه می‌ده تا کل برنامه معطل یه منبع نمونه.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(func, *args, **kwargs)
+        return future.result(timeout=timeout)
+
+
+def _quiet_call(func, *args, **kwargs):
+    """
+    بعضی کتابخونه‌ها (مثل yfinance) وقتی داده پیدا نمی‌کنن، به‌جای Exception
+    یه پیام رو مستقیم توی stdout/stderr چاپ می‌کنن (همون پیام‌های
+    "No data found, symbol may be delisted" که توی لاگ‌های Railway دیده
+    می‌شن). این تابع اون پیام‌ها رو خفه می‌کنه؛ منطق تصمیم‌گیری برنامه همچنان
+    بر اساس خالی بودن دیتافریم انجام می‌شه، نه این پیام‌ها.
+    """
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+        return func(*args, **kwargs)
+
 # ==================================================================
 # بخش ۱: تنظیمات اصلی
 # ==================================================================
@@ -23,7 +50,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 EMA_PERIOD = 5
-DIFF_THRESHOLD = -1          # <-- خودتون عوض کنید (مثلاً -7 یعنی ۷٪ زیر EMA5)
+DIFF_THRESHOLD = -7          # <-- خودتون عوض کنید (مثلاً -7 یعنی ۷٪ زیر EMA5)
 REQUIRE_RED_CANDLES = True
 RED_CANDLE_USE_DAILY = False
 INTRADAY_DISPLAY_DAYS = 1.5
@@ -311,6 +338,7 @@ def answer_callback_query(callback_id, text, show_alert=False):
     except Exception as e:
         log(f"خطا در answerCallbackQuery: {e}")
 
+
 def remove_message_buttons(chat_id, message_id):
     """دکمه‌های زیر یه پیام رو حذف می‌کنه تا کاربر نتونه دوباره روشون کلیک کنه (جلوگیری از سفارش تکراری)."""
     if chat_id is None or message_id is None:
@@ -470,7 +498,7 @@ def add_ema_diff_annotation(ax, df_display, diff_percent):
         ax.annotate(
             f"({sign}{diff_percent:.2f}%)",
             xy=(idx, candle_low), xycoords="data",
-            xytext=(0, -22), textcoords="offset points",
+                    xytext=(0, -22), textcoords="offset points",
             color="#000000", fontsize=20, fontweight="bold",
             ha="center", va="top",
         )
@@ -627,6 +655,7 @@ def format_binance_price(symbol, price):
         return round(price, 6)
     pf = filters["PRICE_FILTER"]
     return _round_to_step(price, pf["tickSize"])
+
 
 # ==================================================================
 # بخش ۷: تفسیر خطاهای بایننس/نوبیتکس به پیام قابل‌فهم
@@ -992,8 +1021,8 @@ def handle_callback_query(callback_query):
             f"برای خرید {symbol_or_base} در {exchange} با سفارش لیمیت روی کف آخرین کندل ۱۵ دقیقه‌ای "
             f"({limit_price})، درصد مجاز ضرر (حد ضرر) رو انتخاب کنید:",
             sl_buttons,
-    )
-        
+        )
+
     elif parts and parts[0] == "slbuy" and len(parts) == 5:
         if mark_consumed_and_check(chat_id, message_id):
             answer_callback_query(callback_id, "این سفارش قبلاً پردازش شده.", show_alert=True)
@@ -1117,6 +1146,7 @@ def check_crypto_market():
             opens30 = [float(c[1]) for c in response]
             closes = [float(c[4]) for c in response]
             volumes = [float(c[5]) for c in response]
+            quote_values = [float(c[7]) for c in response]
             current_price = closes[-1]
 
             ema_value = calculate_ema(closes, EMA_PERIOD)
@@ -1173,6 +1203,7 @@ def check_crypto_market():
                 f"قیمت: {current_price}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
+                f"ارزش کندل آخر (30m): {quote_values[-1]:,.0f} USDT\n"
                 f"نمودار تردینگ‌ویو: {tv_link}\n"
                 f"نمودار بایننس: {binance_link}\n"
                 f"{broker_lines}"
@@ -1210,21 +1241,29 @@ def check_crypto_market():
                         send_telegram_photo(chart_15m, f"⏱ {symbol} - {INTRADAY_DISPLAY_DAYS} روز اخیر، تایم‌فریم ۱۵ دقیقه")
                         time.sleep(0.4)
 
-            # دکمه‌ی خرید فقط وقتی نشون داده میشه که کف کندل ۱۵ دقیقه (قیمت سفارش لیمیت) در دسترس باشه
+            # دکمه‌های لینک: تردینگ‌ویو و بروکرهایی که سفارش‌گذاری خودکار براشون پیاده نشده
+            # (فقط صفحه‌ی خرید رو باز می‌کنن، سفارش واقعی نمی‌زنن)
+            link_buttons = [[{"text": "🔵 خرید در بروکر تردینگ‌ویو", "url": tv_link}]]
+            for broker_name, broker_url in broker_links:
+                if broker_name != "نوبیتکس":
+                    link_buttons.append([{"text": f"🔵 خرید در {broker_name}", "url": broker_url}])
+
+            # دکمه‌ی خرید خودکار (سفارش واقعی/آزمایشی) فقط وقتی نشون داده میشه که
+            # کف کندل ۱۵ دقیقه (قیمت سفارش لیمیت) در دسترس باشه
             if last_low_15m:
                 price_str = format_price_for_callback(last_low_15m)
                 buy_buttons = [[{"text": "🟢 خرید لیمیت آزمایشی در بایننس (کف کندل ۱۵د)",
                                   "callback_data": f"buy:binance:{symbol}:{price_str}"}]]
                 # دکمه‌ی نوبیتکس فقط وقتی اضافه میشه که get_iran_broker_links تایید کنه این جفت‌ارز
-                # همین الان توی نوبیتکس فعاله (بروکرهای دیگه مثل والکس چون اتصال معاملاتی پیاده‌سازی
-                # نشده، دکمه‌ی خرید ندارن -- فقط لینکشون توی caption میاد)
+                # همین الان توی نوبیتکس فعاله
                 for broker_name, _ in broker_links:
                     if broker_name == "نوبیتکس":
                         buy_buttons.append([{"text": "🟢 خرید لیمیت آزمایشی در نوبیتکس (کف کندل ۱۵د)",
                                               "callback_data": f"buy:nobitex:{base_currency}:{price_str}"}])
+                buy_buttons += link_buttons
                 send_telegram_message_with_buttons(caption, buy_buttons)
             else:
-                send_telegram_message(caption)
+                send_telegram_message_with_buttons(caption, link_buttons)
 
         except Exception as e:
             log(f"خطا در پردازش {symbol}: {e}")
@@ -1245,9 +1284,10 @@ def check_us_stocks_market():
     symbols = get_top100_us_symbols()
     total = len(symbols)
     log(f"[سهام] {total} نماد پیدا شد.")
+
     for index, symbol in enumerate(symbols, 1):
         try:
-            data30 = yf.download(symbol, period="5d", interval="30m", progress=False)
+            data30 = _quiet_call(yf.download, symbol, period="5d", interval="30m", progress=False)
             if data30.empty or len(data30) < EMA_PERIOD or len(data30) < 4:
                 continue
             data30 = data30[["Open", "High", "Low", "Close", "Volume"]].copy()
@@ -1267,7 +1307,7 @@ def check_us_stocks_market():
             if had_zero_volume_recently(volumes):
                 continue
 
-            daily_data = yf.download(symbol, period="4mo", interval="1d", progress=False)
+            daily_data = _quiet_call(yf.download, symbol, period="4mo", interval="1d", progress=False)
             if daily_data.empty or len(daily_data) < 4:
                 continue
             daily_df = daily_data[["Open", "High", "Low", "Close"]].copy()
@@ -1300,6 +1340,7 @@ def check_us_stocks_market():
             display_name = get_display_name(symbol, STOCK_NAMES)
             tv_link = get_tradingview_link(symbol, "stock")
 
+            last_value = volumes[-1] * current_price
             red_tf_label = "روزانه" if RED_CANDLE_USE_DAILY else "30m"
             pivot_line = f"شرط پیوت ({PIVOT_TYPE}): قیمت به {pivot_level} رسید ({pivot_value:.6f})\n" if pivot_level else ""
 
@@ -1312,6 +1353,7 @@ def check_us_stocks_market():
                 f"قیمت: {current_price:.2f}\n"
                 f"EMA{EMA_PERIOD}: {ema_value:.4f}\n"
                 f"فاصله: {diff_percent:.2f}%\n"
+                f"ارزش تقریبی کندل آخر (30m): {last_value:,.0f} $\n"
                 f"نمودار تردینگ‌ویو: {tv_link}\n"
                 f"⚠️ خرید مستقیم برای این بازار پشتیبانی نمیشه (فقط اطلاع‌رسانی)."
             )
@@ -1341,7 +1383,7 @@ def check_us_stocks_market():
             # نمودار ۱۵ دقیقه فقط وقتی ارسال میشه که قیمت واقعاً به S2 یا S3 رسیده باشه
             if pivot_ok:
                 try:
-                    data15 = yf.download(symbol, period="5d", interval="15m", progress=False)
+                    data15 = _quiet_call(yf.download, symbol, period="5d", interval="15m", progress=False)
                     if not data15.empty:
                         data15 = data15[["Open", "High", "Low", "Close"]].copy()
                         display_bars_15m = int(min(26 * INTRADAY_DISPLAY_DAYS, len(data15)))
@@ -1394,14 +1436,19 @@ def get_top_tse_symbols(limit=TSE_RANK_LIMIT):
     names = {}
     top_symbols = []
     try:
-        data = att.get_market_snapshot()
+        # هاست منبع اول (old.tsetmc.com) بعضی وقتا از سمت هاستینگ‌های خارج از
+        # ایران (مثل Railway) اصلاً جواب نمی‌ده و کتابخانه هم قبل از خطا دادن
+        # چند بار Retry می‌کنه که خیلی طول می‌کشه. با یه مهلت سخت ۱۲ ثانیه‌ای
+        # زودتر ولش می‌کنیم و می‌ریم سراغ منبع دوم، به‌جای این‌که کل چرخه‌ی
+        # برنامه معطل این یکی بمونه.
+        data = _run_with_timeout(att.get_market_snapshot, 12)
         stocks_df = data["stocks"]
         real = stocks_df[stocks_df["InstrumentType"].isin(TSE_STOCK_TYPES)].copy()
         real = real.sort_values("Volume", ascending=False)
         names = dict(zip(real["Symbol"], real["Name"]))
         top_symbols = real["Symbol"].head(limit).tolist()
     except Exception as e:
-        log(f"⚠️ منبع اول (algotik-tse) برای رتبه‌بندی بازار جواب نداد: {e}")
+        log(f"⚠️ منبع اول (algotik-tse) برای رتبه‌بندی بازار جواب نداد (یا خیلی طول کشید): {e}")
 
     if len(top_symbols) < limit:
         log(f"⚠️ فقط {len(top_symbols)} نماد از منبع اول اومد؛ تلاش برای تکمیل تا {limit} از منبع دوم (pytse-client)...")
@@ -1442,14 +1489,16 @@ def check_tehran_stocks_market():
 
     hist_all = None
     try:
-        hist_all = att.get_history(top_symbols, limit=10, progress=False, dropna=False)
+        hist_all = _run_with_timeout(
+            att.get_history, 20, top_symbols, limit=10, progress=False, dropna=False
+        )
     except Exception as e:
-        log(f"⚠️ خطا در دریافت تاریخچه‌ی دسته‌جمعی از منبع اول: {e}")
+        log(f"⚠️ خطا در دریافت تاریخچه‌ی دسته‌جمعی از منبع اول (یا خیلی طول کشید): {e}")
 
     for index, symbol in enumerate(top_symbols, 1):
         try:
             opens, closes = [], []
-            got_from_batch = (
+             got_from_batch = (
                 hist_all is not None and symbol in hist_all.columns.get_level_values(1)
             )
             if got_from_batch:
@@ -1481,9 +1530,9 @@ def check_tehran_stocks_market():
 
             daily_df = None
             try:
-                daily_df = att.get_history(symbol, limit=120, progress=False)
+                daily_df = _run_with_timeout(att.get_history, 10, symbol, limit=120, progress=False)
             except Exception as e:
-                log(f"منبع اول برای نمودار ۴ ماهه‌ی {symbol} جواب نداد: {e}")
+                log(f"منبع اول برای نمودار ۴ ماهه‌ی {symbol} جواب نداد (یا خیلی طول کشید): {e}")
             if daily_df is None or len(daily_df) < 4:
                 daily_df = get_tse_daily_df_fallback(symbol, limit=120)
             if daily_df is None or len(daily_df) < 4:
@@ -1525,6 +1574,7 @@ def check_tehran_stocks_market():
 
         if index % 40 == 0:
             log(f"[بورس تهران] {index}/{total} اسکن شد...")
+
 
 # ==================================================================
 # بخش ۱۴: حلقه اصلی برنامه
