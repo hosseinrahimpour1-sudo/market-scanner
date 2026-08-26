@@ -3,4 +3,3 @@ yfinance
 pandas
 mplfinance
 algotik-tse
-pytse-client
